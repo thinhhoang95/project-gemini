@@ -208,16 +208,16 @@ class TraversalExtractor:
         text = str(value).strip()
         if not text:
             return None
-        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%Y%m%d"):
+        digits = "".join(ch for ch in text if ch.isdigit())
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y"):
             try:
                 return datetime.strptime(text, fmt).date()
             except ValueError:
                 continue
-        digits = "".join(ch for ch in text if ch.isdigit())
-        if len(digits) == 6:  # YYMMDD
-            return datetime.strptime(digits, "%y%m%d").date()
         if len(digits) == 8:
             return datetime.strptime(digits, "%Y%m%d").date()
+        if len(digits) == 6:  # YYMMDD
+            return datetime.strptime(digits, "%y%m%d").date()
         return None
 
     @staticmethod

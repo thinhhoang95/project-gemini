@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import logging
 import os
 from typing import Iterator, Sequence
 
@@ -10,6 +11,9 @@ import pandas as pd
 
 from .routes import RouteCatalog
 from .traversal_extractor import FlightRouteSegments
+
+
+logger = logging.getLogger(__name__)
 
 
 ORIGINAL_COLUMNS: Sequence[str] = [
@@ -57,9 +61,30 @@ def iter_original_segments(
         usecols=list(dict.fromkeys(ORIGINAL_COLUMNS)),
         chunksize=chunksize,
     )
+    chunk_idx = 0
+    cumulative_matches = 0
     for chunk in reader:
+        chunk_idx += 1
         chunk["flight_identifier"] = chunk["flight_identifier"].astype(str)
         filtered = chunk[chunk["flight_identifier"].isin(flight_ids)]
+        match_count = 0
+        if not filtered.empty:
+            match_count = filtered["flight_identifier"].nunique()
+        if logger.isEnabledFor(logging.DEBUG):
+            if match_count:
+                logger.debug(
+                    "iter_original_segments chunk=%s matched %s flights (cumulative=%s)",
+                    chunk_idx,
+                    match_count,
+                    cumulative_matches + match_count,
+                )
+            elif chunk_idx <= 5 or chunk_idx % 10 == 0:
+                logger.debug(
+                    "iter_original_segments chunk=%s matched 0 flights (rows=%s)",
+                    chunk_idx,
+                    len(chunk),
+                )
+        cumulative_matches += match_count
         if filtered.empty:
             continue
         for flight_id, flight_df in filtered.groupby("flight_identifier"):
@@ -95,11 +120,34 @@ def iter_nonorig_segments(
             usecols=list(dict.fromkeys(NONORIG_COLUMNS)),
             chunksize=chunksize,
         )
+        chunk_idx = 0
+        cumulative_matches = 0
         for chunk in reader:
+            chunk_idx += 1
             chunk["flight_identifier"] = chunk["flight_identifier"].astype(str)
             chunk["route"] = chunk["route"].astype(str).str.strip()
             chunk["__key"] = list(zip(chunk["flight_identifier"], chunk["route"]))
             filtered = chunk[chunk["__key"].isin(route_keys)]
+            match_count = 0
+            if not filtered.empty:
+                match_count = filtered["__key"].nunique()
+            if logger.isEnabledFor(logging.DEBUG):
+                if match_count:
+                    logger.debug(
+                        "iter_nonorig_segments file=%s chunk=%s matched %s route keys (cumulative=%s)",
+                        os.path.basename(file_path),
+                        chunk_idx,
+                        match_count,
+                        cumulative_matches + match_count,
+                    )
+                elif chunk_idx <= 5 or chunk_idx % 10 == 0:
+                    logger.debug(
+                        "iter_nonorig_segments file=%s chunk=%s matched 0 route keys (rows=%s)",
+                        os.path.basename(file_path),
+                        chunk_idx,
+                        len(chunk),
+                    )
+            cumulative_matches += match_count
             if filtered.empty:
                 continue
             filtered = filtered.drop(columns="__key")
