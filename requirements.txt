@@ -1,0 +1,12 @@
+cdsapi
+rich
+numpy
+matplotlib
+seaborn
+xarray
+netcdf4
+pandas
+scikit-learn
+scipy
+cartopy
+geopandas
