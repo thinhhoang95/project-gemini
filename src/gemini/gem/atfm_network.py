@@ -24,8 +24,11 @@ class VolumeTimeSeries:
     lambda_var: List[float]
     queue_mean: List[float]
     queue_var: List[float]
+    queue_cov_lag1: List[float]
     departure_mean: List[float]
     departure_var: List[float]
+    departure_cov_lag1: List[float]
+    queue_reflection_slope: List[float]
 
 
 @dataclass
@@ -82,6 +85,7 @@ class ATFMNetworkModel:
         series = self._init_series()
         prev_pair_weight: Dict[str, Optional[float]] = {v: None for v in self.volume_ids}
         w_bin: Dict[Tuple[str, int], float] = {}
+        arrival_cov_bin: Dict[Tuple[str, int], float] = {}
 
         for t in range(self.num_bins):
             # Step 1: assemble arrival moments
@@ -94,6 +98,7 @@ class ATFMNetworkModel:
             for volume_id in self.volume_ids:
                 nu_t = series[volume_id].lambda_var[t]
                 w_val: float
+                gamma = 0.0
                 if t < self.num_bins - 1:
                     gamma = self._compute_arrival_cov_lag1(volume_id, t, series)
                     nu_next = self._predict_next_variance(volume_id, t, series)
@@ -109,11 +114,19 @@ class ATFMNetworkModel:
                 else:
                     prev_pair = prev_pair_weight.get(volume_id)
                     w_val = prev_pair if prev_pair is not None else 1.0
+                arrival_cov_bin[(volume_id, t)] = gamma
                 w_bin[(volume_id, t)] = _clip_weight(w_val)
 
             # Step 2: queue update per volume using deflated variance
             for volume_id in self.volume_ids:
-                self._queue_step(volume_id, t, capacities, w_bin, series)
+                self._queue_step(
+                    volume_id,
+                    t,
+                    capacities,
+                    w_bin,
+                    arrival_cov_bin,
+                    series,
+                )
 
         total_mean, total_var = self._aggregate_delay(series)
         return ATFMRunResult(
@@ -130,8 +143,11 @@ class ATFMNetworkModel:
                 lambda_var=[0.0] * T,
                 queue_mean=[0.0] * (T + 1),
                 queue_var=[0.0] * (T + 1),
+                queue_cov_lag1=[0.0] * T,
                 departure_mean=[0.0] * T,
                 departure_var=[0.0] * T,
+                departure_cov_lag1=[0.0] * T,
+                queue_reflection_slope=[0.0] * T,
             )
             for v in self.volume_ids
         }
@@ -163,6 +179,12 @@ class ATFMNetworkModel:
                 dep_var = upstream_series.departure_var[departure_bin]
                 lam += kernel_val * dep_mean
                 nu += kernel_val * (1.0 - kernel_val) * dep_mean + (kernel_val**2) * dep_var
+                if departure_bin > 0:
+                    k_next = edge_kernel.get(hour_index, lag + 1)
+                    if k_next != 0.0:
+                        dep_cov = upstream_series.departure_cov_lag1[departure_bin - 1]
+                        if dep_cov != 0.0:
+                            nu += 2.0 * kernel_val * k_next * dep_cov
         return lam, nu
 
     def _compute_arrival_cov_lag1(
@@ -186,11 +208,17 @@ class ATFMNetworkModel:
                 hour_index = departure_bin // self.bins_per_hour
                 k_val = edge_kernel.get(hour_index, lag)
                 k_next = edge_kernel.get(hour_index, lag + 1)
-                if k_val == 0.0 or k_next == 0.0:
-                    continue
-                dep_mean = upstream_series.departure_mean[departure_bin]
-                dep_var = upstream_series.departure_var[departure_bin]
-                gamma += (-dep_mean + dep_var) * k_val * k_next
+                if k_val != 0.0 and k_next != 0.0:
+                    dep_mean = upstream_series.departure_mean[departure_bin]
+                    dep_var = upstream_series.departure_var[departure_bin]
+                    gamma += (-dep_mean + dep_var) * k_val * k_next
+                dep_cov_forward = upstream_series.departure_cov_lag1[departure_bin]
+                if dep_cov_forward != 0.0:
+                    if k_val != 0.0:
+                        gamma += (k_val * k_val) * dep_cov_forward
+                    k_prev = edge_kernel.get(hour_index, lag - 1)
+                    if k_prev != 0.0 and k_next != 0.0:
+                        gamma += k_prev * k_next * dep_cov_forward
         return gamma
 
     def _predict_next_variance(
@@ -213,6 +241,7 @@ class ATFMNetworkModel:
         t: int,
         capacities: Dict[str, List[Optional[float]]],
         w_bin: Dict[Tuple[str, int], float],
+        arrival_cov_bin: Dict[Tuple[str, int], float],
         series: Dict[str, VolumeTimeSeries],
     ) -> None:
         vol_series = series[volume_id]
@@ -234,27 +263,43 @@ class ATFMNetworkModel:
             vol_series.queue_var[t + 1] = 0.0
             vol_series.departure_mean[t] = lam + q_mean
             vol_series.departure_var[t] = max(nu_deflated + q_var, 0.0)
-            return
+            Phi = 0.0  # Reflection slope when no regulation binds.
+        else:
+            delta = lam - cap
+            mu = q_mean + delta
+            sigma2 = max(q_var + nu_deflated, 0.0)
+            sigma = math.sqrt(max(sigma2, 1e-12))
+            a = mu / sigma if sigma > 0 else 0.0
+            phi = _std_normal_pdf(a)
+            Phi = _std_normal_cdf(a)
 
-        delta = lam - cap
-        mu = q_mean + delta
-        sigma2 = max(q_var + nu_deflated, 0.0)
-        sigma = math.sqrt(max(sigma2, 1e-12))
-        a = mu / sigma if sigma > 0 else 0.0
-        phi = _std_normal_pdf(a)
-        Phi = _std_normal_cdf(a)
+            E_Q = sigma * phi + mu * Phi
+            EQ2 = (mu * mu + sigma2) * Phi + mu * sigma * phi
+            Var_Q = max(EQ2 - E_Q * E_Q, 0.0)
 
-        E_Q = sigma * phi + mu * Phi
-        EQ2 = (mu * mu + sigma2) * Phi + mu * sigma * phi
-        Var_Q = max(EQ2 - E_Q * E_Q, 0.0)
+            vol_series.queue_mean[t + 1] = E_Q
+            vol_series.queue_var[t + 1] = Var_Q
+            D_mean = lam + q_mean - E_Q
+            vol_series.departure_mean[t] = D_mean
+            cov_x_y = EQ2 - mu * E_Q  # Covariance of unconstrained queue and its positive part
+            D_var = sigma2 + Var_Q - 2.0 * cov_x_y
+            vol_series.departure_var[t] = max(D_var, 0.0)
 
-        vol_series.queue_mean[t + 1] = E_Q
-        vol_series.queue_var[t + 1] = Var_Q
-        D_mean = lam + q_mean - E_Q
-        vol_series.departure_mean[t] = D_mean
-        cov_x_y = EQ2 - mu * E_Q  # Covariance of unconstrained queue and its positive part
-        D_var = sigma2 + Var_Q - 2.0 * cov_x_y
-        vol_series.departure_var[t] = max(D_var, 0.0)
+        # Lag-1 covariance propagation via reflection linearisation.
+        vol_series.queue_reflection_slope[t] = Phi
+        f_prime = 1.0 - Phi
+        if t == 0:
+            base_var = max(q_var, 0.0)
+            vol_series.queue_cov_lag1[t] = Phi * base_var
+        else:
+            prev_slope = vol_series.queue_reflection_slope[t - 1]
+            cov_y = vol_series.queue_cov_lag1[t - 1] + arrival_cov_bin.get(
+                (volume_id, t - 1), 0.0
+            )
+            queue_cov = prev_slope * Phi * cov_y
+            vol_series.queue_cov_lag1[t] = queue_cov
+            dep_cov = (1.0 - prev_slope) * f_prime * cov_y
+            vol_series.departure_cov_lag1[t - 1] = dep_cov
 
     # ---------------------------------------------------------- aggregation -----
     def _aggregate_delay(self, series: Dict[str, VolumeTimeSeries]) -> Tuple[float, float]:
@@ -263,7 +308,12 @@ class ATFMNetworkModel:
         dt = self.delta_minutes
         for volume_series in series.values():
             total_mean += dt * sum(volume_series.queue_mean[:-1])
-            total_var += (dt * dt) * sum(volume_series.queue_var[:-1])
+            var_sum = 0.0
+            for idx in range(len(volume_series.queue_var) - 1):
+                q_var = volume_series.queue_var[idx]
+                q_cov = volume_series.queue_cov_lag1[idx] if idx < len(volume_series.queue_cov_lag1) else 0.0
+                var_sum += q_var + 2.0 * q_cov
+            total_var += (dt * dt) * var_sum
         return total_mean, total_var
 
 
@@ -387,8 +437,11 @@ def _write_volume_series_csv(
                     "lambda_var": series.lambda_var[t],
                     "queue_mean": series.queue_mean[t],
                     "queue_var": series.queue_var[t],
+                    "queue_cov_lag1": series.queue_cov_lag1[t] if t < len(series.queue_cov_lag1) else 0.0,
                     "departure_mean": series.departure_mean[t],
                     "departure_var": series.departure_var[t],
+                    "departure_cov_lag1": series.departure_cov_lag1[t],
+                    "queue_reflection_slope": series.queue_reflection_slope[t],
                     "delay_minutes_bin": delta_minutes * series.queue_mean[t],
                 }
             )

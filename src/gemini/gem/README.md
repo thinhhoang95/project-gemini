@@ -68,10 +68,13 @@ Conceptually:
   - `VolumeTimeSeries`: for each volume, holds per-bin time series:
     - `lambda_mean`, `lambda_var`: arrival stats.
     - `queue_mean`, `queue_var`: queue length stats (one extra element for state at `T`).
+    - `queue_cov_lag1`: lag-1 queue covariance $\operatorname{Cov}(Q_t,Q_{t+1})$ for delay aggregation.
     - `departure_mean`, `departure_var`: departure stats.
+    - `departure_cov_lag1`: lag-1 departure covariance $\operatorname{Cov}(D_t,D_{t+1})$ used when forming downstream arrival statistics.
+    - `queue_reflection_slope`: helper slope $\Phi(a_t)$ from the reflected-Gaussian update (primarily for diagnostics).
   - `ATFMRunResult`:
     - `by_volume`: mapping `volume_id → VolumeTimeSeries`.
-    - `total_delay_mean`, `total_delay_var`: integrated network delay over all volumes and time.
+    - `total_delay_mean`, `total_delay_var`: integrated network delay over all volumes and time (variance uses the lag-1 queue covariance correction).
 
 - **`ATFMNetworkModel`** (`atfm_network.py`)
   - The **core propagation engine** that:
