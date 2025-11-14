@@ -1,3 +1,5 @@
+> The reference for the complete algorithm can be found in the [master guide](docs/gemini_master_guide.md).
+
 ## High-level overview
 
 The `atfm_network` module implements a **chronological ATFM (Air Traffic Flow Management) propagation** over a network of traffic volumes.  
