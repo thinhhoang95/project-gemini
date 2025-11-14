@@ -1,4 +1,136 @@
 """CLI entry point for empirical hourly-kernel estimation."""
+"""CLI entry point for empirical hourly-kernel estimation.
+
+This script processes 4D trajectory segments (both ORIGINAL flights and candidate
+routes) to compute empirical hourly kernels that model propagation probabilities
+through regulated airspace volumes. The kernels estimate the probability distribution
+of traversal times (lags) between volume edges, conditional on the hour of day.
+
+Inputs:
+--------
+1. Master flights CSV (--master-flights)
+   Path to CSV containing ORIGINAL flight trajectory segments.
+   Expected columns:
+   - flight_identifier: unique flight ID (str)
+   - time_begin_segment, time_end_segment: segment time bounds
+   - date_begin_segment, date_end_segment: segment date bounds
+   - _start_datetime: flight start timestamp
+   - latitude_begin, longitude_begin: segment start position
+   - latitude_end, longitude_end: segment end position
+   - flight_level_begin, flight_level_end: altitude bounds
+   - sequence: segment ordering
+   
+   Example: /Volumes/CrucialX/project-tailwind/output/flights_20230717_0000-2359.csv
+
+2. Strictly better routes CSV (--strictly-better-routes)
+   Path to CSV mapping each flight to ORIGINAL vs candidate routes.
+   Expected columns:
+   - flight_identifier: unique flight ID (str)
+   - route: route label, either "ORIGINAL" or a candidate route identifier (str)
+   
+   Example:
+   flight_identifier,route
+   ABC123,ORIGINAL
+   ABC123,ROUTE_A
+   ABC123,ROUTE_B
+   
+   Example path: /Volumes/CrucialX/project-gemini/data/strictly_better_routes.csv
+
+3. Non-ORIGINAL 4D segments directory (--nonorig-4d-segments-dir)
+   Directory containing partitioned CSV.GZ files with candidate route segments.
+   Each file should contain segments with columns:
+   - flight_identifier: unique flight ID (str)
+   - route: candidate route label (str)
+   - time_begin_segment, time_end_segment: segment time bounds
+   - latitude_begin, longitude_begin: segment start position
+   - latitude_end, longitude_end: segment end position
+   - flight_level_begin, flight_level_end: altitude bounds
+   
+   Example: /Volumes/CrucialX/project-silverdrizzle/tmp/all_segs_unsharded/
+
+4. Traffic volumes GeoJSON (--volumes-geojson)
+   GeoJSON file describing regulated traffic volumes (sectors/regions).
+   Used to map trajectory points to volume identifiers for edge traversal.
+   
+   Example: /Volumes/CrucialX/project-tailwind/output/wxm_sm_ih_maxpool.geojson
+
+5. TVTW indexer JSON (--tvtw-indexer)
+   Serialized TVTWIndexer JSON containing temporal binning metadata:
+   - time_bin_minutes: duration of each time bin (int)
+   - num_bins: total number of bins in the planning horizon (int)
+   - bins_per_hour: number of bins per hour (int)
+   
+   Example: /Volumes/CrucialX/project-tailwind/output/tvtw_indexer.json
+
+6. Planning day (--planning-day)
+   Date string in YYYY-MM-DD format used to anchor local time calculations.
+   
+   Example: "2023-07-17"
+
+Processing Parameters:
+----------------------
+- --max-lag-bins: Maximum lag (in bins) kept per edge (defaults to full horizon)
+- --shrinkage-M: Shrinkage constant M used in Step K3 for empirical Bayes (default: 75.0)
+- --min-traversals-per-edge: Minimum traversals required per edge; edges below threshold are dropped (default: 5)
+- --sampling-distance-km: Target spatial spacing between sampled 4D points along segments (default: 10.0)
+- --sampling-time-seconds: Target temporal spacing between sampled 4D points (default: 120.0)
+- --chunk-size: Chunk size for streaming CSV ingestion (default: 200,000)
+- --log-every: Log progress after processing N flight-route trajectories (default: 250)
+- --num-workers: Number of worker processes for parallel processing (default: n_cpu - 1)
+
+Outputs:
+--------
+1. Hourly kernels CSV (--output-kernels)
+   CSV file containing the empirical hourly kernel table.
+   Each row represents a kernel value for a specific (edge, hour, lag) combination.
+   
+   Columns:
+   - edge_u: upstream volume identifier (str)
+   - edge_v: downstream volume identifier (str)
+   - edge_id: string representation of edge (str)
+   - hour_index: hour of day (0-23) (int)
+   - lag_bins: traversal lag in bins (int)
+   - lag_minutes: traversal lag in minutes (float)
+   - kernel_value: empirical kernel probability [0.0, 1.0] (float)
+   - traversal_count_hour: number of traversals for this edge-hour (int)
+   - lag_count_hour: count for this specific lag in this hour (int)
+   - traversal_count_edge: total traversals for this edge across all hours (int)
+   - lost_count_hour: lost/censored traversals for this edge-hour (int)
+   - lost_fraction_hour: fraction of traversals lost/censored in this hour (float)
+   - lost_count_edge: total lost/censored traversals for this edge (int)
+   - alpha: shrinkage weight used in empirical Bayes [0.0, 1.0] (float)
+   - delta_minutes: time bin duration in minutes (int)
+   
+   Example output row:
+   edge_u,edge_v,edge_id,hour_index,lag_bins,lag_minutes,kernel_value,traversal_count_hour,lag_count_hour,traversal_count_edge,lost_count_hour,lost_fraction_hour,lost_count_edge,alpha,delta_minutes
+   VOL_001,VOL_002,VOL_001->VOL_002,14,5,60.0,0.15,100,15,500,0,0.0,5,0.571,12.0
+   
+   Example path: /Volumes/CrucialX/project-gemini/data/hourly_kernels.csv
+
+2. Log output (stdout/stderr)
+   Progress logs including:
+   - Loading status for each input file
+   - Processing statistics (traversals retained, censored, dropped)
+   - Final kernel table statistics (rows, edges)
+   - Extractor statistics (counters for various processing events)
+
+The kernel_value represents the empirical probability that a flight traversing edge
+(edge_u -> edge_v) during hour_index will have a lag of lag_bins bins between
+departure and arrival. Values are computed using empirical Bayes shrinkage (Step K3)
+that blends hour-specific empirical distributions with global edge-level priors.
+
+Example Usage:
+--------------
+    python -m gemini.propagation.compute_hourly_kernels_cli_mp \\
+        --master-flights /path/to/flights.csv \\
+        --strictly-better-routes /path/to/routes.csv \\
+        --nonorig-4d-segments-dir /path/to/segments/ \\
+        --volumes-geojson /path/to/volumes.geojson \\
+        --tvtw-indexer /path/to/tvtw_indexer.json \\
+        --output-kernels /path/to/output.csv \\
+        --planning-day 2023-07-17 \\
+        --num-workers 8
+"""
 
 from __future__ import annotations
 
@@ -123,11 +255,6 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         type=int,
         default=200_000,
         help="Chunk size for streaming CSV ingestion.",
-    )
-    parser.add_argument(
-        "--emit-empty-hours",
-        action="store_true",
-        help="Emit per-hour kernels even when a specific hour has zero traversals.",
     )
     parser.add_argument(
         "--log-every",
@@ -335,7 +462,7 @@ def main(argv: Iterable[str] | None = None) -> None:
         max_lag_bins=max_lag_bins,
         shrinkage_M=args.shrinkage_M,
         min_traversals_per_edge=args.min_traversals_per_edge,
-        emit_empty_hours=args.emit_empty_hours,
+        emit_empty_hours=True
     )
 
     cpu_total = os.cpu_count() or 1
@@ -381,36 +508,16 @@ def main(argv: Iterable[str] | None = None) -> None:
         initargs=(extractor_payload,),
     ) as pool:
         with progress:
-            original_task = progress.add_task(
-                f"ORIGINAL flights ({original_total:,})" if original_total else "ORIGINAL flights",
-                total=original_total or None,
-            )
             nonorig_task = progress.add_task(
                 f"NON-ORIGINAL flights ({nonorig_total:,})"
                 if nonorig_total
                 else "NON-ORIGINAL flights",
                 total=nonorig_total or None,
             )
-
-            logging.info(
-                "Processing ORIGINAL flights (route catalog has %s entries).", f"{original_total:,}"
+            original_task = progress.add_task(
+                f"ORIGINAL flights ({original_total:,})" if original_total else "ORIGINAL flights",
+                total=original_total or None,
             )
-            if original_total:
-                total_routes, total_traversals = _process_route_group(
-                    pool=pool,
-                    routes=iter_original_segments(
-                        args.master_flights, route_catalog, chunksize=args.chunk_size
-                    ),
-                    estimator=estimator,
-                    stats_counter=stats_counter,
-                    progress=progress,
-                    progress_task=original_task,
-                    log_every=args.log_every,
-                    total_routes=total_routes,
-                    total_traversals=total_traversals,
-                )
-            else:
-                logging.info("Route catalog contains no ORIGINAL flights; skipping.")
 
             logging.info(
                 "Processing NON-ORIGINAL trajectories (route catalog has %s candidate routes).",
@@ -435,9 +542,30 @@ def main(argv: Iterable[str] | None = None) -> None:
             else:
                 logging.info("Route catalog contains no NON-ORIGINAL candidates; skipping.")
 
+            logging.info(
+                "Processing ORIGINAL flights (route catalog has %s entries).", f"{original_total:,}"
+            )
+            if original_total:
+                total_routes, total_traversals = _process_route_group(
+                    pool=pool,
+                    routes=iter_original_segments(
+                        args.master_flights, route_catalog, chunksize=args.chunk_size
+                    ),
+                    estimator=estimator,
+                    stats_counter=stats_counter,
+                    progress=progress,
+                    progress_task=original_task,
+                    log_every=args.log_every,
+                    total_routes=total_routes,
+                    total_traversals=total_traversals,
+                )
+            else:
+                logging.info("Route catalog contains no ORIGINAL flights; skipping.")
+
     logging.info(
-        "Finished traversal extraction: %s traversals retained (%s dropped).",
+        "Finished traversal extraction: %s traversals retained (%s censored, %s dropped).",
         estimator.total_records,
+        estimator.total_censored,
         estimator.dropped_records,
     )
     rows = estimator.finalize_kernels()

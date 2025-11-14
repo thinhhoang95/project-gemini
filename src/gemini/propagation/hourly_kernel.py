@@ -37,29 +37,49 @@ class HourlyKernelEstimator:
         self.edge_hour_lag_counts: Dict[Tuple[EdgeId, int], Dict[int, int]] = defaultdict(
             lambda: defaultdict(int)
         )
+        self.edge_hour_lost_counts: Dict[Tuple[EdgeId, int], int] = defaultdict(int)
         self.edge_totals: Dict[EdgeId, int] = defaultdict(int)
         self.edge_lag_totals: Dict[EdgeId, Dict[int, int]] = defaultdict(
             lambda: defaultdict(int)
         )
+        self.edge_lost_totals: Dict[EdgeId, int] = defaultdict(int)
         self.total_records = 0
+        self.total_departures = 0
+        self.total_censored = 0
         self.dropped_records = 0
 
     # ------------------------------------------------------------------ ingestion
     def add_traversal(self, record: TraversalRecord) -> None:
         """Consume a traversal if it satisfies the lag constraints."""
-        if record.lag_bins <= 0 or record.lag_bins > self.max_lag_bins:
+        arrival_observed = getattr(record, "arrival_observed", True)
+        if record.dep_bin < 0 or record.dep_bin >= self.num_bins:
             self.dropped_records += 1
             return
-        if record.dep_bin < 0 or record.arr_bin >= self.num_bins:
+        if record.hour_index < 0:
             self.dropped_records += 1
             return
 
+        if arrival_observed:
+            if record.arr_bin < 0 or record.arr_bin >= self.num_bins:
+                self.dropped_records += 1
+                return
+            if record.lag_bins <= 0 or record.lag_bins > self.max_lag_bins:
+                self.dropped_records += 1
+                return
+
         key = (record.edge, record.hour_index)
         self.edge_hour_counts[key] += 1
-        self.edge_hour_lag_counts[key][record.lag_bins] += 1
         self.edge_totals[record.edge] += 1
-        self.edge_lag_totals[record.edge][record.lag_bins] += 1
-        self.total_records += 1
+        self.total_departures += 1
+
+        if arrival_observed:
+            self.edge_hour_lag_counts[key][record.lag_bins] += 1
+            self.edge_lag_totals[record.edge][record.lag_bins] += 1
+            self.total_records += 1
+        else:
+            self.edge_hour_lost_counts[key] += 1
+            self.edge_lost_totals[record.edge] += 1
+            self.total_censored += 1
 
     # ---------------------------------------------------------------- computation
     def finalize_kernels(self) -> List[Dict[str, float]]:
@@ -72,6 +92,7 @@ class HourlyKernelEstimator:
             if total_traversals < self.min_traversals_per_edge:
                 continue
             global_lag_counts = self.edge_lag_totals[edge]
+            lost_count_edge = self.edge_lost_totals.get(edge, 0)
             hours: Iterable[int]
             if self.emit_empty_hours:
                 hours = range(self.hours_per_day)
@@ -88,6 +109,8 @@ class HourlyKernelEstimator:
                 if N_eh > 0:
                     alpha = N_eh / (N_eh + self.shrinkage_M)
                 lag_counts = self.edge_hour_lag_counts.get((edge, hour), {})
+                lost_count_hour = self.edge_hour_lost_counts.get((edge, hour), 0)
+                lost_fraction_hour = (lost_count_hour / N_eh) if N_eh > 0 else 0.0
 
                 for lag in range(1, self.max_lag_bins + 1):
                     local_prob = (lag_counts.get(lag, 0) / N_eh) if N_eh > 0 else 0.0
@@ -111,6 +134,9 @@ class HourlyKernelEstimator:
                             "traversal_count_hour": N_eh,
                             "lag_count_hour": lag_counts.get(lag, 0),
                             "traversal_count_edge": total_traversals,
+                            "lost_count_hour": lost_count_hour,
+                            "lost_fraction_hour": lost_fraction_hour,
+                            "lost_count_edge": lost_count_edge,
                             "alpha": alpha,
                             "delta_minutes": self.delta_minutes,
                         }

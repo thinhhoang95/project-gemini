@@ -317,8 +317,9 @@ def main(argv: Iterable[str] | None = None) -> None:
                 )
 
     logging.info(
-        "Finished traversal extraction: %s traversals retained (%s dropped).",
+        "Finished traversal extraction: %s traversals retained (%s censored, %s dropped).",
         estimator.total_records,
+        estimator.total_censored,
         estimator.dropped_records,
     )
     rows = estimator.finalize_kernels()

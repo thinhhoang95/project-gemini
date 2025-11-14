@@ -76,6 +76,7 @@ class TraversalExtractor:
             "sample_points": 0,
             "volume_entries": 0,
             "traversals_emitted": 0,
+            "traversals_censored": 0,
             "traversals_dropped": 0,
         }
 
@@ -98,9 +99,7 @@ class TraversalExtractor:
         if len(entries) < 2:
             return
 
-        for record in self._records_from_entries(entries, flight_segments):
-            self.stats["traversals_emitted"] += 1
-            yield record
+        yield from self._records_from_entries(entries, flight_segments)
 
     # ----------------------------------------------------------------- diagnostics
     def get_stats(self) -> dict:
@@ -298,21 +297,36 @@ class TraversalExtractor:
             downstream, arr_time = entries[idx + 1]
             if upstream == downstream:
                 continue
+
             dep_minutes = self._minutes_from_midnight(dep_time)
-            arr_minutes = self._minutes_from_midnight(arr_time)
-            if dep_minutes < 0 or arr_minutes < 0:
-                continue
-            if dep_minutes >= self.max_minutes or arr_minutes >= self.max_minutes:
-                continue
-            dep_bin = self.tvtw_indexer.minutes_to_bin(dep_minutes)
-            arr_bin = self.tvtw_indexer.minutes_to_bin(arr_minutes)
-            lag = arr_bin - dep_bin
-            if lag <= 0 or lag > self.max_lag_bins:
+            if dep_minutes < 0 or dep_minutes >= self.max_minutes:
                 self.stats["traversals_dropped"] += 1
                 continue
+
+            dep_bin = self.tvtw_indexer.minutes_to_bin(dep_minutes)
             hour_index = dep_bin // self.bins_per_hour
             edge = EdgeId(upstream=upstream, downstream=downstream)
-            yield TraversalRecord(
+
+            arr_minutes = self._minutes_from_midnight(arr_time)
+            arrival_observed = True
+            censor_reason: Optional[str] = None
+            arr_bin = -1
+            lag = 0
+
+            if arr_minutes < 0 or arr_minutes >= self.max_minutes:
+                arrival_observed = False
+                censor_reason = "arrival_outside_horizon"
+            else:
+                arr_bin = self.tvtw_indexer.minutes_to_bin(arr_minutes)
+                lag = arr_bin - dep_bin
+                if lag <= 0:
+                    arrival_observed = False
+                    censor_reason = "nonpositive_lag"
+                elif lag > self.max_lag_bins:
+                    arrival_observed = False
+                    censor_reason = "lag_exceeds_max"
+
+            record = TraversalRecord(
                 edge=edge,
                 dep_bin=dep_bin,
                 arr_bin=arr_bin,
@@ -323,7 +337,15 @@ class TraversalExtractor:
                 flight_id=flight_segments.flight_id,
                 route_label=flight_segments.route_label,
                 group=flight_segments.group,
+                arrival_observed=arrival_observed,
+                censor_reason=censor_reason,
             )
+
+            if arrival_observed:
+                self.stats["traversals_emitted"] += 1
+            else:
+                self.stats["traversals_censored"] += 1
+            yield record
 
     def _minutes_from_midnight(self, dt_value: datetime) -> float:
         return (dt_value - self.day_start).total_seconds() / 60.0
