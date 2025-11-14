@@ -24,6 +24,7 @@ class FlightRouteSegments:
     route_label: str
     group: str
     segments: pd.DataFrame
+    route_weight: float = 1.0
 
 
 @dataclass
@@ -292,6 +293,7 @@ class TraversalExtractor:
         entries: Sequence[Tuple[str, datetime]],
         flight_segments: FlightRouteSegments,
     ) -> Iterator[TraversalRecord]:
+        route_weight = getattr(flight_segments, "route_weight", 1.0)
         for idx in range(len(entries) - 1):
             upstream, dep_time = entries[idx]
             downstream, arr_time = entries[idx + 1]
@@ -339,6 +341,7 @@ class TraversalExtractor:
                 group=flight_segments.group,
                 arrival_observed=arrival_observed,
                 censor_reason=censor_reason,
+                weight=route_weight,
             )
 
             if arrival_observed:

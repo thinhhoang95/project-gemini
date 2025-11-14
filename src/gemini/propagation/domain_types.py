@@ -43,3 +43,4 @@ class TraversalRecord:
     group: Optional[str] = None  # ORIGINAL vs NONORIG
     arrival_observed: bool = True
     censor_reason: Optional[str] = None
+    weight: float = 1.0

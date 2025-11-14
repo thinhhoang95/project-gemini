@@ -19,7 +19,7 @@ Inputs:
    - flight_level_begin, flight_level_end: altitude bounds
    - sequence: segment ordering
    
-   Example: /mnt/d/project-tailwind/output/flights_20230717_0000-2359.csv
+   Example: D:/project-tailwind/output/flights_20230717_0000-2359.csv
 
 2. Strictly better routes CSV (--strictly-better-routes)
    Path to CSV mapping each flight to ORIGINAL vs candidate routes.
@@ -33,7 +33,7 @@ Inputs:
    ABC123,ROUTE_A
    ABC123,ROUTE_B
    
-   Example path: /mnt/d/project-gemini/data/strictly_better_routes.csv
+   Example path: D:/project-gemini/data/strictly_better_routes.csv
 
 3. Non-ORIGINAL 4D segments directory (--nonorig-4d-segments-dir)
    Directory containing partitioned CSV.GZ files with candidate route segments.
@@ -45,13 +45,13 @@ Inputs:
    - latitude_end, longitude_end: segment end position
    - flight_level_begin, flight_level_end: altitude bounds
    
-   Example: /mnt/d/project-silverdrizzle/tmp/all_segs_unsharded/
+   Example: D:/project-silverdrizzle/tmp/all_segs_unsharded/
 
 4. Traffic volumes GeoJSON (--volumes-geojson)
    GeoJSON file describing regulated traffic volumes (sectors/regions).
    Used to map trajectory points to volume identifiers for edge traversal.
    
-   Example: /mnt/d/project-tailwind/output/wxm_sm_ih_maxpool.geojson
+   Example: D:/project-tailwind/output/wxm_sm_ih_maxpool.geojson
 
 5. TVTW indexer JSON (--tvtw-indexer)
    Serialized TVTWIndexer JSON containing temporal binning metadata:
@@ -59,7 +59,7 @@ Inputs:
    - num_bins: total number of bins in the planning horizon (int)
    - bins_per_hour: number of bins per hour (int)
    
-   Example: /mnt/d/project-tailwind/output/tvtw_indexer.json
+   Example: D:/project-tailwind/output/tvtw_indexer.json
 
 6. Planning day (--planning-day)
    Date string in YYYY-MM-DD format used to anchor local time calculations.
@@ -104,7 +104,7 @@ Outputs:
    edge_u,edge_v,edge_id,hour_index,lag_bins,lag_minutes,kernel_value,traversal_count_hour,lag_count_hour,traversal_count_edge,lost_count_hour,lost_fraction_hour,lost_count_edge,alpha,delta_minutes
    VOL_001,VOL_002,VOL_001->VOL_002,14,5,60.0,0.15,100,15,500,0,0.0,5,0.571,12.0
    
-   Example path: /mnt/d/project-gemini/data/hourly_kernels.csv
+   Example path: D:/project-gemini/data/hourly_kernels.csv
 
 2. Log output (stdout/stderr)
    Progress logs including:
@@ -176,12 +176,12 @@ except ModuleNotFoundError:  # Allows running the CLI as a standalone script.
     from gemini.propagation.tvtw_indexer import TVTWIndexer
     from gemini.propagation.volume_graph import VolumeGraph, VolumeLocator
 
-DEFAULT_MASTER = "/mnt/d/project-tailwind/output/flights_20230717_0000-2359.csv"
-DEFAULT_ROUTES = "/mnt/d/project-gemini/data/strictly_better_routes.csv"
-DEFAULT_SEGMENTS_DIR = "/mnt/d/project-silverdrizzle/tmp/all_segs_unsharded"
-DEFAULT_GEOJSON = "/mnt/d/project-tailwind/output/wxm_sm_ih_maxpool.geojson"
-DEFAULT_TVTW = "/mnt/d/project-tailwind/output/tvtw_indexer.json"
-DEFAULT_OUTPUT = "/mnt/d/project-gemini/data/hourly_kernels.csv"
+DEFAULT_MASTER = "D:/project-tailwind/output/flights_20230717_0000-2359.csv"
+DEFAULT_ROUTES = "D:/project-gemini/data/strictly_better_routes.csv"
+DEFAULT_SEGMENTS_DIR = "D:/project-silverdrizzle/tmp/all_segs_unsharded"
+DEFAULT_GEOJSON = "D:/project-tailwind/output/wxm_sm_ih_maxpool.geojson"
+DEFAULT_TVTW = "D:/project-tailwind/output/tvtw_indexer.json"
+DEFAULT_OUTPUT = "D:/project-gemini/data/hourly_kernels.csv"
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
@@ -483,14 +483,14 @@ def main(argv: Iterable[str] | None = None) -> None:
     total_traversals = 0
 
     original_total = len(route_catalog.original_flights)
-    nonorig_total = sum(len(routes) for routes in route_catalog.nonorig_routes.values())
+    nonorig_route_total = sum(len(routes) for routes in route_catalog.nonorig_routes.values())
     progress_console = Console(stderr=True)
     progress_columns = [
         SpinnerColumn(),
         TextColumn("{task.description}"),
         BarColumn(bar_width=None),
         TaskProgressColumn(),
-        TextColumn("{task.completed:,} flights", justify="right"),
+        TextColumn("{task.completed:,} trajectories", justify="right"),
         TimeElapsedColumn(),
     ]
     progress = Progress(
@@ -508,10 +508,12 @@ def main(argv: Iterable[str] | None = None) -> None:
     ) as pool:
         with progress:
             nonorig_task = progress.add_task(
-                f"NON-ORIGINAL flights ({nonorig_total:,})"
-                if nonorig_total
-                else "NON-ORIGINAL flights",
-                total=nonorig_total or None,
+                (
+                    f"NON-ORIGINAL route candidates ({nonorig_route_total:,})"
+                    if nonorig_route_total
+                    else "NON-ORIGINAL route candidates"
+                ),
+                total=nonorig_route_total or None,
             )
             original_task = progress.add_task(
                 f"ORIGINAL flights ({original_total:,})" if original_total else "ORIGINAL flights",
@@ -520,9 +522,9 @@ def main(argv: Iterable[str] | None = None) -> None:
 
             logging.info(
                 "Processing NON-ORIGINAL trajectories (route catalog has %s candidate routes).",
-                f"{nonorig_total:,}",
+                f"{nonorig_route_total:,}",
             )
-            if nonorig_total:
+            if nonorig_route_total:
                 total_routes, total_traversals = _process_route_group(
                     pool=pool,
                     routes=iter_nonorig_segments(

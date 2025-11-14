@@ -5,7 +5,7 @@ from __future__ import annotations
 import glob
 import logging
 import os
-from typing import Iterator, Sequence
+from typing import Iterator, Optional, Sequence
 
 import pandas as pd
 
@@ -43,8 +43,70 @@ NONORIG_COLUMNS: Sequence[str] = [
     "flight_level_begin",
     "flight_level_end",
     "route",
+    "p_route",
 ]
 
+NONORIG_OPTIONAL_COLUMNS = {"p_route"}
+
+
+def _determine_nonorig_usecols(csv_path: str) -> list[str]:
+    """Return the subset of NONORIG columns that exist inside the given CSV."""
+    desired_cols = list(dict.fromkeys(NONORIG_COLUMNS))
+    header_df = pd.read_csv(csv_path, nrows=0)
+    available = set(header_df.columns)
+    missing_required = [
+        column
+        for column in desired_cols
+        if column not in available and column not in NONORIG_OPTIONAL_COLUMNS
+    ]
+    if missing_required:
+        missing_list = ", ".join(missing_required)
+        raise ValueError(f"{csv_path} is missing required columns: {missing_list}")
+    missing_optional = [
+        column for column in NONORIG_OPTIONAL_COLUMNS if column in desired_cols and column not in available
+    ]
+    if missing_optional and logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "Optional columns %s missing in %s; continuing without weights.",
+            ", ".join(missing_optional),
+            os.path.basename(csv_path),
+        )
+    return [column for column in desired_cols if column in available]
+
+
+def _extract_route_weight(
+    route_df: pd.DataFrame, *, flight_id: str, route_label: str
+) -> Optional[float]:
+    """Return the weight for a route, defaulting to 1.0 if p_route absent."""
+    if "p_route" not in route_df.columns:
+        return 1.0
+    p_series = pd.to_numeric(route_df["p_route"], errors="coerce").dropna()
+    if p_series.empty:
+        logger.warning(
+            "Skipping NON-ORIGINAL flight %s (%s) due to missing p_route values.",
+            flight_id,
+            route_label,
+        )
+        return None
+    unique_values = pd.unique(p_series)
+    route_weight = float(unique_values[0])
+    if len(unique_values) > 1:
+        logger.warning(
+            "Found multiple p_route values for flight %s (%s); using %s.",
+            flight_id,
+            route_label,
+            route_weight,
+        )
+    clamped_weight = min(max(route_weight, 0.0), 1.0)
+    if clamped_weight != route_weight:
+        logger.warning(
+            "Clamped p_route for flight %s (%s) from %s to %s.",
+            flight_id,
+            route_label,
+            route_weight,
+            clamped_weight,
+        )
+    return clamped_weight
 
 def iter_original_segments(
     master_csv_path: str,
@@ -93,6 +155,7 @@ def iter_original_segments(
                 route_label="ORIGINAL",
                 group="ORIGINAL",
                 segments=flight_df.copy(),
+                route_weight=1.0,
             )
 
 
@@ -123,11 +186,13 @@ def iter_nonorig_segments(
             f"No CSV/CSV.GZ files were found under {segments_dir} matching '*.csv*'."
         )
     target_flights = set(route_catalog.nonorig_routes)
-    carryover = pd.DataFrame(columns=list(dict.fromkeys(NONORIG_COLUMNS)))
+    desired_columns = list(dict.fromkeys(NONORIG_COLUMNS))
+    carryover = pd.DataFrame(columns=desired_columns)
     for file_path in files:
+        usecols = _determine_nonorig_usecols(file_path)
         reader = pd.read_csv(
             file_path,
-            usecols=list(dict.fromkeys(NONORIG_COLUMNS)),
+            usecols=usecols,
             chunksize=chunksize,
         )
         chunk_idx = 0
@@ -203,11 +268,17 @@ def iter_nonorig_segments(
                 for route_label, route_df in flight_df.groupby("route", sort=False):
                     if route_label not in routes:
                         continue
+                    route_weight = _extract_route_weight(
+                        route_df, flight_id=flight_id, route_label=route_label
+                    )
+                    if route_weight is None:
+                        continue
                     yield FlightRouteSegments(
                         flight_id=flight_id,
                         route_label=route_label,
                         group="NONORIG",
                         segments=route_df.copy(),
+                        route_weight=route_weight,
                     )
 
     if not carryover.empty:
@@ -223,9 +294,15 @@ def iter_nonorig_segments(
                 for route_label, route_df in flight_df.groupby("route", sort=False):
                     if route_label not in routes:
                         continue
+                    route_weight = _extract_route_weight(
+                        route_df, flight_id=flight_id, route_label=route_label
+                    )
+                    if route_weight is None:
+                        continue
                     yield FlightRouteSegments(
                         flight_id=flight_id,
                         route_label=route_label,
                         group="NONORIG",
                         segments=route_df.copy(),
+                        route_weight=route_weight,
                     )
