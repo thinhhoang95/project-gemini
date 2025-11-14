@@ -65,7 +65,7 @@ def iter_original_segments(
     cumulative_matches = 0
     for chunk in reader:
         chunk_idx += 1
-        chunk["flight_identifier"] = chunk["flight_identifier"].astype(str)
+        chunk["flight_identifier"] = chunk["flight_identifier"].astype(str).str.strip()
         filtered = chunk[chunk["flight_identifier"].isin(flight_ids)]
         match_count = 0
         if not filtered.empty:
@@ -134,7 +134,7 @@ def iter_nonorig_segments(
         cumulative_matches = 0
         for chunk in reader:
             chunk_idx += 1
-            chunk["flight_identifier"] = chunk["flight_identifier"].astype(str)
+            chunk["flight_identifier"] = chunk["flight_identifier"].astype(str).str.strip()
             chunk["route"] = chunk["route"].astype(str).str.strip()
             if not carryover.empty:
                 chunk = pd.concat([carryover, chunk], ignore_index=True)

@@ -1,4 +1,3 @@
-"""CLI entry point for empirical hourly-kernel estimation."""
 """CLI entry point for empirical hourly-kernel estimation.
 
 This script processes 4D trajectory segments (both ORIGINAL flights and candidate
@@ -20,7 +19,7 @@ Inputs:
    - flight_level_begin, flight_level_end: altitude bounds
    - sequence: segment ordering
    
-   Example: /Volumes/CrucialX/project-tailwind/output/flights_20230717_0000-2359.csv
+   Example: /mnt/d/project-tailwind/output/flights_20230717_0000-2359.csv
 
 2. Strictly better routes CSV (--strictly-better-routes)
    Path to CSV mapping each flight to ORIGINAL vs candidate routes.
@@ -34,7 +33,7 @@ Inputs:
    ABC123,ROUTE_A
    ABC123,ROUTE_B
    
-   Example path: /Volumes/CrucialX/project-gemini/data/strictly_better_routes.csv
+   Example path: /mnt/d/project-gemini/data/strictly_better_routes.csv
 
 3. Non-ORIGINAL 4D segments directory (--nonorig-4d-segments-dir)
    Directory containing partitioned CSV.GZ files with candidate route segments.
@@ -46,13 +45,13 @@ Inputs:
    - latitude_end, longitude_end: segment end position
    - flight_level_begin, flight_level_end: altitude bounds
    
-   Example: /Volumes/CrucialX/project-silverdrizzle/tmp/all_segs_unsharded/
+   Example: /mnt/d/project-silverdrizzle/tmp/all_segs_unsharded/
 
 4. Traffic volumes GeoJSON (--volumes-geojson)
    GeoJSON file describing regulated traffic volumes (sectors/regions).
    Used to map trajectory points to volume identifiers for edge traversal.
    
-   Example: /Volumes/CrucialX/project-tailwind/output/wxm_sm_ih_maxpool.geojson
+   Example: /mnt/d/project-tailwind/output/wxm_sm_ih_maxpool.geojson
 
 5. TVTW indexer JSON (--tvtw-indexer)
    Serialized TVTWIndexer JSON containing temporal binning metadata:
@@ -60,7 +59,7 @@ Inputs:
    - num_bins: total number of bins in the planning horizon (int)
    - bins_per_hour: number of bins per hour (int)
    
-   Example: /Volumes/CrucialX/project-tailwind/output/tvtw_indexer.json
+   Example: /mnt/d/project-tailwind/output/tvtw_indexer.json
 
 6. Planning day (--planning-day)
    Date string in YYYY-MM-DD format used to anchor local time calculations.
@@ -105,7 +104,7 @@ Outputs:
    edge_u,edge_v,edge_id,hour_index,lag_bins,lag_minutes,kernel_value,traversal_count_hour,lag_count_hour,traversal_count_edge,lost_count_hour,lost_fraction_hour,lost_count_edge,alpha,delta_minutes
    VOL_001,VOL_002,VOL_001->VOL_002,14,5,60.0,0.15,100,15,500,0,0.0,5,0.571,12.0
    
-   Example path: /Volumes/CrucialX/project-gemini/data/hourly_kernels.csv
+   Example path: /mnt/d/project-gemini/data/hourly_kernels.csv
 
 2. Log output (stdout/stderr)
    Progress logs including:
@@ -177,12 +176,12 @@ except ModuleNotFoundError:  # Allows running the CLI as a standalone script.
     from gemini.propagation.tvtw_indexer import TVTWIndexer
     from gemini.propagation.volume_graph import VolumeGraph, VolumeLocator
 
-DEFAULT_MASTER = "/Volumes/CrucialX/project-tailwind/output/flights_20230717_0000-2359.csv"
-DEFAULT_ROUTES = "/Volumes/CrucialX/project-gemini/data/strictly_better_routes.csv"
-DEFAULT_SEGMENTS_DIR = "/Volumes/CrucialX/project-silverdrizzle/tmp/all_segs_unsharded"
-DEFAULT_GEOJSON = "/Volumes/CrucialX/project-tailwind/output/wxm_sm_ih_maxpool.geojson"
-DEFAULT_TVTW = "/Volumes/CrucialX/project-tailwind/output/tvtw_indexer.json"
-DEFAULT_OUTPUT = "/Volumes/CrucialX/project-gemini/data/hourly_kernels.csv"
+DEFAULT_MASTER = "/mnt/d/project-tailwind/output/flights_20230717_0000-2359.csv"
+DEFAULT_ROUTES = "/mnt/d/project-gemini/data/strictly_better_routes.csv"
+DEFAULT_SEGMENTS_DIR = "/mnt/d/project-silverdrizzle/tmp/all_segs_unsharded"
+DEFAULT_GEOJSON = "/mnt/d/project-tailwind/output/wxm_sm_ih_maxpool.geojson"
+DEFAULT_TVTW = "/mnt/d/project-tailwind/output/tvtw_indexer.json"
+DEFAULT_OUTPUT = "/mnt/d/project-gemini/data/hourly_kernels.csv"
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
