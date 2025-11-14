@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import heapq
 import math
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -60,7 +61,8 @@ class ATFMNetworkModel:
         self.num_bins = tvtw.num_bins
         self.delta_minutes = tvtw.time_bin_minutes
         self.bins_per_hour = tvtw.bins_per_hour
-        self.volume_ids: List[str] = list(volume_graph.volumes.keys())
+        base_order: List[str] = list(volume_graph.volumes.keys())
+        self.volume_ids: List[str] = self._build_volume_order(base_order)
 
     # ---------------------------------------------------------------------- API --
     def run(self, plan: Optional[RegulationPlan] = None) -> ATFMRunResult:
@@ -79,6 +81,34 @@ class ATFMNetworkModel:
             volume_id: [None] * self.num_bins for volume_id in self.volume_ids
         }
 
+    def _build_volume_order(self, base_order: List[str]) -> List[str]:
+        """Return a propagation order ensuring upstream queues precede downstream."""
+        in_degree: Dict[str, int] = {volume_id: 0 for volume_id in base_order}
+        adjacency: Dict[str, List[str]] = {volume_id: [] for volume_id in base_order}
+        for edge in self.kernels.edges.keys():
+            upstream = edge.upstream
+            downstream = edge.downstream
+            if upstream not in adjacency or downstream not in adjacency:
+                continue
+            adjacency[upstream].append(downstream)
+            in_degree[downstream] += 1
+        rank = {volume_id: idx for idx, volume_id in enumerate(base_order)}
+        ready = [(rank[vid], vid) for vid, deg in in_degree.items() if deg == 0]
+        heapq.heapify(ready)
+        order: List[str] = []
+        while ready:
+            _, volume_id = heapq.heappop(ready)
+            order.append(volume_id)
+            for downstream in adjacency.get(volume_id, []):
+                in_degree[downstream] -= 1
+                if in_degree[downstream] == 0:
+                    heapq.heappush(ready, (rank[downstream], downstream))
+        if len(order) != len(base_order):
+            placed = set(order)
+            remaining = [vid for vid in base_order if vid not in placed]
+            order.extend(remaining)
+        return order
+
     def _run_with_capacities(
         self, capacities: Dict[str, List[Optional[float]]]
     ) -> ATFMRunResult:
@@ -94,7 +124,7 @@ class ATFMNetworkModel:
                 series[volume_id].lambda_mean[t] = lam
                 series[volume_id].lambda_var[t] = nu
 
-            # Step 1b: compute F1 pair/per-bin weights
+            # Step 1b and Step 2: per-volume weight and queue update
             for volume_id in self.volume_ids:
                 nu_t = series[volume_id].lambda_var[t]
                 w_val: float
@@ -116,9 +146,6 @@ class ATFMNetworkModel:
                     w_val = prev_pair if prev_pair is not None else 1.0
                 arrival_cov_bin[(volume_id, t)] = gamma
                 w_bin[(volume_id, t)] = _clip_weight(w_val)
-
-            # Step 2: queue update per volume using deflated variance
-            for volume_id in self.volume_ids:
                 self._queue_step(
                     volume_id,
                     t,
@@ -180,7 +207,9 @@ class ATFMNetworkModel:
                 lam += kernel_val * dep_mean
                 nu += kernel_val * (1.0 - kernel_val) * dep_mean + (kernel_val**2) * dep_var
                 if departure_bin > 0:
-                    k_next = edge_kernel.get(hour_index, lag + 1)
+                    prev_departure_bin = departure_bin - 1
+                    hour_index_next = prev_departure_bin // self.bins_per_hour
+                    k_next = edge_kernel.get(hour_index_next, lag + 1)
                     if k_next != 0.0:
                         dep_cov = upstream_series.departure_cov_lag1[departure_bin - 1]
                         if dep_cov != 0.0:
@@ -199,7 +228,7 @@ class ATFMNetworkModel:
 
         for edge in incoming_edges:
             edge_kernel = self.kernels.edges[edge]
-            max_lag = min(edge_kernel.max_lag_bins - 1, t)
+            max_lag = min(edge_kernel.max_lag_bins, t)
             if max_lag <= 0:
                 continue
             upstream_series = series[edge.upstream]
@@ -207,7 +236,11 @@ class ATFMNetworkModel:
                 departure_bin = t - lag
                 hour_index = departure_bin // self.bins_per_hour
                 k_val = edge_kernel.get(hour_index, lag)
-                k_next = edge_kernel.get(hour_index, lag + 1)
+                k_next = 0.0
+                if lag + 1 <= edge_kernel.max_lag_bins and departure_bin > 0:
+                    next_departure_bin = departure_bin - 1
+                    next_hour_index = next_departure_bin // self.bins_per_hour
+                    k_next = edge_kernel.get(next_hour_index, lag + 1)
                 if k_val != 0.0 and k_next != 0.0:
                     dep_mean = upstream_series.departure_mean[departure_bin]
                     dep_var = upstream_series.departure_var[departure_bin]
@@ -216,7 +249,11 @@ class ATFMNetworkModel:
                 if dep_cov_forward != 0.0:
                     if k_val != 0.0:
                         gamma += (k_val * k_val) * dep_cov_forward
-                    k_prev = edge_kernel.get(hour_index, lag - 1)
+                    k_prev = 0.0
+                    if lag > 1:
+                        prev_departure_bin = departure_bin + 1
+                        prev_hour_index = prev_departure_bin // self.bins_per_hour
+                        k_prev = edge_kernel.get(prev_hour_index, lag - 1)
                     if k_prev != 0.0 and k_next != 0.0:
                         gamma += k_prev * k_next * dep_cov_forward
         return gamma
@@ -288,17 +325,17 @@ class ATFMNetworkModel:
         # Lag-1 covariance propagation via reflection linearisation.
         vol_series.queue_reflection_slope[t] = Phi
         f_prime = 1.0 - Phi
+        fresh_cov = max(q_var + nu_deflated, 0.0)
         if t == 0:
-            base_var = max(q_var, 0.0)
-            vol_series.queue_cov_lag1[t] = Phi * base_var
+            vol_series.queue_cov_lag1[t] = Phi * fresh_cov
         else:
             prev_slope = vol_series.queue_reflection_slope[t - 1]
-            cov_y = vol_series.queue_cov_lag1[t - 1] + arrival_cov_bin.get(
+            base_cov = vol_series.queue_cov_lag1[t - 1] + arrival_cov_bin.get(
                 (volume_id, t - 1), 0.0
             )
-            queue_cov = prev_slope * Phi * cov_y
+            queue_cov = prev_slope * Phi * (base_cov + fresh_cov)
             vol_series.queue_cov_lag1[t] = queue_cov
-            dep_cov = (1.0 - prev_slope) * f_prime * cov_y
+            dep_cov = (1.0 - prev_slope) * f_prime * base_cov
             vol_series.departure_cov_lag1[t - 1] = dep_cov
 
     # ---------------------------------------------------------- aggregation -----
@@ -309,10 +346,15 @@ class ATFMNetworkModel:
         for volume_series in series.values():
             total_mean += dt * sum(volume_series.queue_mean[:-1])
             var_sum = 0.0
-            for idx in range(len(volume_series.queue_var) - 1):
-                q_var = volume_series.queue_var[idx]
-                q_cov = volume_series.queue_cov_lag1[idx] if idx < len(volume_series.queue_cov_lag1) else 0.0
-                var_sum += q_var + 2.0 * q_cov
+            num_queue_bins = max(0, len(volume_series.queue_var) - 1)
+            cov_limit = min(
+                len(volume_series.queue_cov_lag1),
+                max(0, len(volume_series.queue_mean) - 2),
+            )
+            for idx in range(num_queue_bins):
+                var_sum += volume_series.queue_var[idx]
+                if idx < cov_limit:
+                    var_sum += 2.0 * volume_series.queue_cov_lag1[idx]
             total_var += (dt * dt) * var_sum
         return total_mean, total_var
 
