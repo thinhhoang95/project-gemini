@@ -229,10 +229,11 @@ class ATFMNetworkModel:
             cap = capacity_list[t]
 
         if cap is None:
+            # Entire backlog is released immediately when there is no cap.
             vol_series.queue_mean[t + 1] = 0.0
             vol_series.queue_var[t + 1] = 0.0
-            vol_series.departure_mean[t] = lam
-            vol_series.departure_var[t] = max(nu_deflated, 0.0)
+            vol_series.departure_mean[t] = lam + q_mean
+            vol_series.departure_var[t] = max(nu_deflated + q_var, 0.0)
             return
 
         delta = lam - cap
@@ -251,9 +252,9 @@ class ATFMNetworkModel:
         vol_series.queue_var[t + 1] = Var_Q
         D_mean = lam + q_mean - E_Q
         vol_series.departure_mean[t] = D_mean
-        p_cong = Phi
-        D_var = max((1.0 - p_cong) * nu_deflated, 0.0)
-        vol_series.departure_var[t] = D_var
+        cov_x_y = EQ2 - mu * E_Q  # Covariance of unconstrained queue and its positive part
+        D_var = sigma2 + Var_Q - 2.0 * cov_x_y
+        vol_series.departure_var[t] = max(D_var, 0.0)
 
     # ---------------------------------------------------------- aggregation -----
     def _aggregate_delay(self, series: Dict[str, VolumeTimeSeries]) -> Tuple[float, float]:

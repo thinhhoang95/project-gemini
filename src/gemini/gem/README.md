@@ -282,12 +282,12 @@ For each `volume_id`:
      - `cap = capacity_list[t]` if defined, else `None`.
 
   3. **Unregulated case (`cap is None`)**:
-     - Intuition: no capacity constraint → no queue can build up.
+     - Intuition: any existing backlog instantly departs once the queue is unregulated.
      - Actions:
        - `queue_mean[t+1] = 0.0`
        - `queue_var[t+1] = 0.0`
-       - `departure_mean[t] = lam` (all arrivals depart)
-       - `departure_var[t] = max(nu_deflated, 0.0)` (same variance as arrivals)
+       - `departure_mean[t] = lam + q_mean` (arrivals plus backlog depart)
+       - `departure_var[t] = max(nu_deflated + q_var, 0.0)` (preserve queue variance)
        - Return.
 
   4. **Regulated case (`cap` is a float)**:
@@ -318,11 +318,9 @@ For each `volume_id`:
        - Flow conservation: departures = arrivals + current queue - next queue
        - `D_mean = lam + q_mean - E_Q`
        - `departure_mean[t] = D_mean`
-
-       - Congestion probability:
-         - `p_cong = Phi` (approx probability queue is positive).
-       - Departure variance:
-         - `D_var = max((1.0 - p_cong) * nu_deflated, 0.0)`
+       - Departure variance uses \( D_t = \Lambda_t + Q_t - Q_{t+1} \):
+         - Let `cov_x_y = EQ2 - mu * E_Q` (covariance of \(Q_t+\Lambda_t-cap\) with the truncated queue).
+         - `D_var = max(sigma2 + Var_Q - 2 * cov_x_y, 0.0)`
        - `departure_var[t] = D_var`
 
 **Idea**: Each bin is treated as a single-step queue update where arrivals plus previous queue either exceed capacity (queue persists) or not (queue drains). The algorithm uses a normal approximation to compute expectations and variances.
@@ -506,4 +504,3 @@ print(series_A.queue_mean[:10])  # first 10 bins of queue for VOL_A
 ```
 
 This programmatic view mirrors what the CLI does, but gives you direct access to `VolumeTimeSeries` and lets you integrate ATFM propagation into other pipelines.
-
