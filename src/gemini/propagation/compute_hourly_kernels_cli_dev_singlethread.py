@@ -6,6 +6,7 @@ import argparse
 import logging
 import os
 from datetime import datetime
+from time import perf_counter
 from typing import Iterable
 
 import pandas as pd
@@ -148,7 +149,7 @@ def configure_logging(level: str) -> None:
 
 def main(argv: Iterable[str] | None = None) -> None:
     args = parse_args(argv)
-    configure_logging(args.log_level)
+    configure_logging("DEBUG")
 
     planning_day = datetime.strptime(args.planning_day, "%Y-%m-%d").date()
     logging.info("Loading TVTW indexer from %s", args.tvtw_indexer)
@@ -212,41 +213,113 @@ def main(argv: Iterable[str] | None = None) -> None:
             total=nonorig_total or None,
         )
 
-        logging.info("Processing ORIGINAL flights...")
+        logging.info(
+            "Processing ORIGINAL flights (route catalog has %s entries).", f"{original_total:,}"
+        )
         for flight_route in iter_original_segments(
             args.master_flights, route_catalog, chunksize=args.chunk_size
         ):
             total_routes += 1
+            segment_count = (
+                len(flight_route.segments)
+                if getattr(flight_route, "segments", None) is not None
+                else 0
+            )
+            route_start = perf_counter()
+            logging.debug(
+                "Starting ORIGINAL flight %s | segments=%s",
+                flight_route.flight_id,
+                segment_count,
+            )
+            traversal_count = 0
             for traversal in extractor.extract_traversals(flight_route):
                 estimator.add_traversal(traversal)
                 total_traversals += 1
+                traversal_count += 1
+            elapsed = perf_counter() - route_start
+            if traversal_count == 0:
+                logging.warning(
+                    "ORIGINAL flight %s yielded zero traversals (segments=%s, elapsed=%.2fs)",
+                    flight_route.flight_id,
+                    segment_count,
+                    elapsed,
+                )
+            else:
+                logging.debug(
+                    "Finished ORIGINAL flight %s | traversals=%s | elapsed=%.2fs",
+                    flight_route.flight_id,
+                    traversal_count,
+                    elapsed,
+                )
             progress.advance(original_task, 1)
             if args.log_every and total_routes % args.log_every == 0:
                 logging.info(
-                    "Processed %s ORIGINAL trajectories | total traversals=%s",
+                    "Processed %s ORIGINAL trajectories | last flight=%s | traversals=%s | total traversals=%s | last elapsed=%.2fs",
                     total_routes,
+                    flight_route.flight_id,
+                    traversal_count,
                     total_traversals,
+                    elapsed,
                 )
 
-        logging.info("Processing NON-ORIGINAL trajectories...")
+        logging.info(
+            "Processing NON-ORIGINAL trajectories (route catalog has %s candidate routes).",
+            f"{nonorig_total:,}",
+        )
         for flight_route in iter_nonorig_segments(
             args.nonorig_4d_segments_dir, route_catalog, chunksize=args.chunk_size
         ):
             total_routes += 1
+            segment_count = (
+                len(flight_route.segments)
+                if getattr(flight_route, "segments", None) is not None
+                else 0
+            )
+            route_start = perf_counter()
+            logging.debug(
+                "Starting NON-ORIGINAL flight %s / route %s | segments=%s",
+                flight_route.flight_id,
+                flight_route.route_label,
+                segment_count,
+            )
+            traversal_count = 0
             for traversal in extractor.extract_traversals(flight_route):
                 estimator.add_traversal(traversal)
                 total_traversals += 1
+                traversal_count += 1
+            elapsed = perf_counter() - route_start
+            if traversal_count == 0:
+                logging.warning(
+                    "NON-ORIGINAL flight %s (%s) yielded zero traversals (segments=%s, elapsed=%.2fs)",
+                    flight_route.flight_id,
+                    flight_route.route_label,
+                    segment_count,
+                    elapsed,
+                )
+            else:
+                logging.debug(
+                    "Finished NON-ORIGINAL flight %s (%s) | traversals=%s | elapsed=%.2fs",
+                    flight_route.flight_id,
+                    flight_route.route_label,
+                    traversal_count,
+                    elapsed,
+                )
             progress.advance(nonorig_task, 1)
             if args.log_every and total_routes % args.log_every == 0:
                 logging.info(
-                    "Processed %s total trajectories | total traversals=%s",
+                    "Processed %s total trajectories | last flight=%s (%s) | traversals=%s | total traversals=%s | last elapsed=%.2fs",
                     total_routes,
+                    flight_route.flight_id,
+                    flight_route.route_label,
+                    traversal_count,
                     total_traversals,
+                    elapsed,
                 )
 
     logging.info(
-        "Finished traversal extraction: %s traversals retained (%s dropped).",
+        "Finished traversal extraction: %s traversals retained (%s censored, %s dropped).",
         estimator.total_records,
+        estimator.total_censored,
         estimator.dropped_records,
     )
     rows = estimator.finalize_kernels()

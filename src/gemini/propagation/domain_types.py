@@ -29,7 +29,7 @@ class EdgeId:
 
 @dataclass
 class TraversalRecord:
-    """Single traversal of an edge with the timing metadata required for K0–K3."""
+    """Single traversal (or censored departure) with metadata for Steps K0–K3."""
 
     edge: EdgeId
     dep_bin: int
@@ -41,3 +41,6 @@ class TraversalRecord:
     flight_id: Optional[str] = None
     route_label: Optional[str] = None
     group: Optional[str] = None  # ORIGINAL vs NONORIG
+    arrival_observed: bool = True
+    censor_reason: Optional[str] = None
+    weight: float = 1.0
