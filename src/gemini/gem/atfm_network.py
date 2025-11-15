@@ -124,16 +124,21 @@ class ATFMNetworkModel:
                 series[volume_id].lambda_mean[t] = lam
                 series[volume_id].lambda_var[t] = nu
 
-            # Step 1b and Step 2: per-volume weight and queue update
+            # Step 1b: build F1 deflation weights using a provisional arrival
+            # lag-1 covariance γ_{v,t,t+1} based on information up to this point.
+            # We intentionally do *not* store this provisional γ into arrival_cov_bin
+            # yet, because departure_cov_lag1[t-1] will be refined by the queue
+            # step below. A second pass after the queue update will write the
+            # final γ_{v,t,t+1} consistent with Cov(D_{u,t-1}, D_{u,t}) for all
+            # upstream nodes u, regardless of volume ordering.
             for volume_id in self.volume_ids:
                 nu_t = series[volume_id].lambda_var[t]
                 w_val: float
-                gamma = 0.0
                 if t < self.num_bins - 1:
-                    gamma = self._compute_arrival_cov_lag1(volume_id, t, series)
+                    gamma_prov = self._compute_arrival_cov_lag1(volume_id, t, series)
                     nu_next = self._predict_next_variance(volume_id, t, series)
                     denom = max(nu_t + nu_next, 1e-6)
-                    pair = 1.0 + 2.0 * gamma / denom
+                    pair = 1.0 + 2.0 * gamma_prov / denom
                     pair = _clip_weight(pair)
                     prev_pair = prev_pair_weight.get(volume_id)
                     if prev_pair is None:
@@ -144,8 +149,13 @@ class ATFMNetworkModel:
                 else:
                     prev_pair = prev_pair_weight.get(volume_id)
                     w_val = prev_pair if prev_pair is not None else 1.0
-                arrival_cov_bin[(volume_id, t)] = gamma
                 w_bin[(volume_id, t)] = _clip_weight(w_val)
+
+            # Step 2: queue update using the F1 weights. This step updates
+            # departure_cov_lag1[t-1] for each volume (when t > 0), which is
+            # required to form the fully corrected arrival lag-1 covariance
+            # γ_{v,t,t+1} in equation (10) of the master guide.
+            for volume_id in self.volume_ids:
                 self._queue_step(
                     volume_id,
                     t,
@@ -154,6 +164,20 @@ class ATFMNetworkModel:
                     arrival_cov_bin,
                     series,
                 )
+
+            # Step 1b (final): now that all upstream departure covariances
+            # Cov(D_{u,t-1}, D_{u,t}) are available from the queue step, build
+            # the *final* arrival lag-1 covariance for this bin and store it in
+            # arrival_cov_bin. This makes γ_{v,t,t+1} consistent with the
+            # reflected-queue dynamics for use in subsequent bins (queue
+            # covariance propagation and future F1 weights).
+            if t < self.num_bins - 1:
+                for volume_id in self.volume_ids:
+                    gamma = self._compute_arrival_cov_lag1(volume_id, t, series)
+                    arrival_cov_bin[(volume_id, t)] = gamma
+            else:
+                for volume_id in self.volume_ids:
+                    arrival_cov_bin[(volume_id, t)] = 0.0
 
         total_mean, total_var = self._aggregate_delay(series)
         return ATFMRunResult(
