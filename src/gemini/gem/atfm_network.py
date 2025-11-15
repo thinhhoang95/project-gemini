@@ -185,7 +185,6 @@ class ATFMNetworkModel:
     ) -> Tuple[float, float]:
         lam = self.arrivals.mean(volume_id, t)
         nu = self.arrivals.variance(volume_id, t)
-
         incoming_edges = self.kernels.get_incoming(volume_id)
         if not incoming_edges:
             return lam, nu
@@ -199,21 +198,24 @@ class ATFMNetworkModel:
             for lag in range(1, max_lag + 1):
                 departure_bin = t - lag
                 hour_index = departure_bin // self.bins_per_hour
-                kernel_val = edge_kernel.get(hour_index, lag)
-                if kernel_val == 0.0:
+                k_val = edge_kernel.get(hour_index, lag)
+                if k_val == 0.0:
                     continue
                 dep_mean = upstream_series.departure_mean[departure_bin]
                 dep_var = upstream_series.departure_var[departure_bin]
-                lam += kernel_val * dep_mean
-                nu += kernel_val * (1.0 - kernel_val) * dep_mean + (kernel_val**2) * dep_var
-                if departure_bin > 0:
-                    prev_departure_bin = departure_bin - 1
-                    hour_index_next = prev_departure_bin // self.bins_per_hour
-                    k_next = edge_kernel.get(hour_index_next, lag + 1)
+                lam += k_val * dep_mean
+                nu += k_val * (1.0 - k_val) * dep_mean + (k_val * k_val) * dep_var
+
+                # Cross-bin variance term from Cov(D_{t-k-1}, D_{t-k}) as in eq. (8)
+                # of the master guide. Use the hour of the departure bin for both
+                # lags so that K_{e,h}(k) and K_{e,h}(k+1) are evaluated at the same
+                # hourly kernel, consistent with the generative definition.
+                if departure_bin > 0 and lag < edge_kernel.max_lag_bins:
+                    k_next = edge_kernel.get(hour_index, lag + 1)
                     if k_next != 0.0:
                         dep_cov = upstream_series.departure_cov_lag1[departure_bin - 1]
                         if dep_cov != 0.0:
-                            nu += 2.0 * kernel_val * k_next * dep_cov
+                            nu += 2.0 * k_val * k_next * dep_cov
         return lam, nu
 
     def _compute_arrival_cov_lag1(
@@ -221,6 +223,8 @@ class ATFMNetworkModel:
     ) -> float:
         if t >= self.num_bins - 1:
             return 0.0
+
+        # Start from exogenous lag-1 covariance γ^{ext}_{v,t,t+1}.
         gamma = self.arrivals.covariance_lag1(volume_id, t)
         incoming_edges = self.kernels.get_incoming(volume_id)
         if not incoming_edges:
@@ -228,34 +232,38 @@ class ATFMNetworkModel:
 
         for edge in incoming_edges:
             edge_kernel = self.kernels.edges[edge]
-            max_lag = min(edge_kernel.max_lag_bins, t)
+            # We need k+1 to be valid, so restrict to at most (max_lag_bins - 1).
+            max_lag = min(edge_kernel.max_lag_bins - 1, t)
             if max_lag <= 0:
                 continue
             upstream_series = series[edge.upstream]
             for lag in range(1, max_lag + 1):
                 departure_bin = t - lag
                 hour_index = departure_bin // self.bins_per_hour
-                k_val = edge_kernel.get(hour_index, lag)
-                k_next = 0.0
-                if lag + 1 <= edge_kernel.max_lag_bins and departure_bin > 0:
-                    next_departure_bin = departure_bin - 1
-                    next_hour_index = next_departure_bin // self.bins_per_hour
-                    k_next = edge_kernel.get(next_hour_index, lag + 1)
-                if k_val != 0.0 and k_next != 0.0:
-                    dep_mean = upstream_series.departure_mean[departure_bin]
-                    dep_var = upstream_series.departure_var[departure_bin]
-                    gamma += (-dep_mean + dep_var) * k_val * k_next
+                k = edge_kernel.get(hour_index, lag)
+                k_plus = edge_kernel.get(hour_index, lag + 1)
+                if k == 0.0 and k_plus == 0.0:
+                    continue
+
+                dep_mean = upstream_series.departure_mean[departure_bin]
+                dep_var = upstream_series.departure_var[departure_bin]
+
+                # First two terms in eq. (10): (-E[D] + Var(D)) * K(k) * K(k+1).
+                if k != 0.0 and k_plus != 0.0:
+                    gamma += (-dep_mean + dep_var) * k * k_plus
+
+                # Cov(D_{t-k}, D_{t-k+1}) terms.
                 dep_cov_forward = upstream_series.departure_cov_lag1[departure_bin]
                 if dep_cov_forward != 0.0:
-                    if k_val != 0.0:
-                        gamma += (k_val * k_val) * dep_cov_forward
-                    k_prev = 0.0
-                    if lag > 1:
-                        prev_departure_bin = departure_bin + 1
-                        prev_hour_index = prev_departure_bin // self.bins_per_hour
-                        k_prev = edge_kernel.get(prev_hour_index, lag - 1)
-                    if k_prev != 0.0 and k_next != 0.0:
-                        gamma += k_prev * k_next * dep_cov_forward
+                    # K(k)^2 * Cov(D_{t-k}, D_{t-k+1})
+                    if k != 0.0:
+                        gamma += (k * k) * dep_cov_forward
+
+                    # K(k-1) * K(k+1) * Cov(D_{t-k}, D_{t-k+1})
+                    if lag > 1 and k_plus != 0.0:
+                        k_minus = edge_kernel.get(hour_index, lag - 1)
+                        if k_minus != 0.0:
+                            gamma += k_minus * k_plus * dep_cov_forward
         return gamma
 
     def _predict_next_variance(

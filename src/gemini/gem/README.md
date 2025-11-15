@@ -235,7 +235,7 @@ For each `volume_id`:
 Key steps:
 
 1. **Base quantities**:
-   - `nu_t = series[volume_id].lambda_var[t]` (current variance).
+   - `nu_t = series[volume_id].lambda_var[t]` (current, fully propagated variance).
    - If `t < num_bins - 1`, we attempt to estimate correlation with bin `t+1`.
 
 2. **Arrival covariance at lag 1 (`gamma`)**:
@@ -248,8 +248,9 @@ Key steps:
 
 3. **Proxy for next-bin variance `nu_next`**:
    - `_predict_next_variance(...)`:
-     - Use `arrivals.variance(volume_id, t+1)` if available.
-     - If zero, fallback to current bin variance.
+     - Uses the **fully propagated** arrival variance at `t` as a local-stationarity
+       proxy for `ν_{t+1}`, so that F1 reflects both exogenous and network-induced
+       variability.
 
 4. **Compute pair weight**:
    - Denominator: `denom = max(nu_t + nu_next, 1e-6)`.
@@ -268,7 +269,7 @@ The F1 weight partially reduces variance to keep the queue approximation stable 
 
 For each `volume_id`:
 
-- `_queue_step(volume_id, t, capacities, w_bin, series)`:
+- `_queue_step(volume_id, t, capacities, w_bin, arrival_cov_bin, series)`:
 
   1. **Fetch current state**:
      - From `series[volume_id]`:
@@ -336,14 +337,22 @@ After all time bins are processed:
 
   - For each volume’s `volume_series`:
     - `total_mean += delta_minutes * sum(volume_series.queue_mean[:-1])`
-    - `total_var += (delta_minutes**2) * sum(volume_series.queue_var[:-1])`
+    - For the variance, approximate the variance of the time-integrated queue as:
+      - \[
+          \operatorname{Var}\Bigl(\sum_t Q_t\Bigr)
+          \approx \sum_t \operatorname{Var}(Q_t)
+                  + 2 \sum_t \operatorname{Cov}(Q_t, Q_{t+1}),
+        \]
+        implemented as:
+        - `var_sum = sum(queue_var[t] + 2 * queue_cov_lag1[t] for t in valid_bins)`
+        - `total_var += (delta_minutes**2) * var_sum`
 
   - `delta_minutes = self.delta_minutes = tvtw.time_bin_minutes`.
 
 - Interpreted as:
   - **Total delay mean** = integral (sum over time bins) of queue length (flights) × bin duration (minutes)  
     ⇒ units: flight-minutes.
-  - **Total delay variance** similarly scaled.
+  - **Total delay variance** = same integral but with a **lag‑1 covariance correction** via `queue_cov_lag1` to account for temporal correlation in queue length.
 
 Result is packaged into `ATFMRunResult`.
 
