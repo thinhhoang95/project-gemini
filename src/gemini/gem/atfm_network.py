@@ -261,15 +261,13 @@ class ATFMNetworkModel:
     def _predict_next_variance(
         self, volume_id: str, t: int, series: Dict[str, VolumeTimeSeries]
     ) -> float:
-        """Online proxy for ν_{t+1} used in the F1 weight."""
-        next_bin = t + 1
-        if next_bin >= self.num_bins:
-            return series[volume_id].lambda_var[t]
-        # Default to exogenous variance if provided, otherwise reuse current.
-        nu_next = self.arrivals.variance(volume_id, next_bin)
-        if nu_next == 0.0:
-            nu_next = series[volume_id].lambda_var[t]
-        return nu_next
+        """Online proxy for ν_{t+1} used in the F1 weight.
+
+        We use the fully propagated arrival variance at t as a local-stationarity
+        proxy for the next bin so that F1 reflects network-induced variability,
+        not just exogenous structure.
+        """
+        return series[volume_id].lambda_var[t]
 
     # ------------------------------------------------------------- queue update --
     def _queue_step(
@@ -323,19 +321,27 @@ class ATFMNetworkModel:
             vol_series.departure_var[t] = max(D_var, 0.0)
 
         # Lag-1 covariance propagation via reflection linearisation.
+        # Phi is the reflection slope mapping the unconstrained queue U_t to Q_{t+1}.
         vol_series.queue_reflection_slope[t] = Phi
-        f_prime = 1.0 - Phi
-        fresh_cov = max(q_var + nu_deflated, 0.0)
+        u_var_t = max(q_var + nu_deflated, 0.0)  # Var(U_t) if needed elsewhere
+
         if t == 0:
-            vol_series.queue_cov_lag1[t] = Phi * fresh_cov
+            # Start-of-day queue is deterministic (Q_0 = 0), so Cov(Q_0, Q_1) ≈ 0.
+            vol_series.queue_cov_lag1[t] = 0.0
         else:
             prev_slope = vol_series.queue_reflection_slope[t - 1]
+            # Approximate Cov(U_{t-1}, U_t) as Cov(Q_{t-1}, Q_t) + Cov(Λ_{t-1}, Λ_t),
+            # ignoring cross terms such as Cov(Q_{t-1}, Λ_t).
             base_cov = vol_series.queue_cov_lag1[t - 1] + arrival_cov_bin.get(
                 (volume_id, t - 1), 0.0
             )
-            queue_cov = prev_slope * Phi * (base_cov + fresh_cov)
+
+            # Queue lag-1 covariance: Cov(Q_t, Q_{t+1}) ≈ Φ_{t-1} Φ_t Cov(U_{t-1}, U_t).
+            queue_cov = prev_slope * Phi * base_cov
             vol_series.queue_cov_lag1[t] = queue_cov
-            dep_cov = (1.0 - prev_slope) * f_prime * base_cov
+
+            # Departure lag-1 covariance: Cov(D_{t-1}, D_t) ≈ (1-Φ_{t-1})(1-Φ_t) Cov(U_{t-1}, U_t).
+            dep_cov = (1.0 - prev_slope) * (1.0 - Phi) * base_cov
             vol_series.departure_cov_lag1[t - 1] = dep_cov
 
     # ---------------------------------------------------------- aggregation -----
