@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, List, Sequence
 
 import pandas as pd
@@ -126,8 +127,25 @@ def load_fr_segments(
 
 
 def _read_csv_subset(path: str, columns: Iterable[str]) -> pd.DataFrame:
-    df = pd.read_csv(path, usecols=list(columns))
+    compression = _detect_compression(path)
+    df = pd.read_csv(path, usecols=list(columns), compression=compression)
     return df
+
+
+def _detect_compression(path: str) -> str | None:
+    suffix = Path(path).suffix.lower()
+    if suffix == ".gz":
+        return "gzip"
+    try:
+        with open(path, "rb") as handle:
+            magic = handle.read(2)
+            if magic == b"\x1f\x8b":
+                return "gzip"
+    except FileNotFoundError:
+        raise
+    except OSError:
+        logger.debug("Unable to read %s to detect compression.", path, exc_info=True)
+    return "infer"
 
 
 def _is_finite_positive(value: float) -> bool:

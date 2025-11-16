@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "project-gemini"
+version = "0.1.0"
+description = "A Python project for flight arrival analysis and ATFM network management"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Thinh Hoang", email = "dthoang@intuelle.com"}
+]
+dependencies = [
+    "cdsapi",
+    "rich",
+    "numpy",
+    "matplotlib",
+    "seaborn",
+    "xarray",
+    "netcdf4",
+    "pandas",
+    "scikit-learn",
+    "scipy",
+    "cartopy",
+    "geopandas",
+    "shapely",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "black",
+    "flake8",
+    "mypy",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["gemini*"]
+

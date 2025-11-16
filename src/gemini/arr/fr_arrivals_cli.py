@@ -12,10 +12,18 @@ from gemini.arrivals.flight_list_gemini import FlightListGemini
 from gemini.arrivals.ground_jitter_config import GroundJitterConfig
 from gemini.gem.arrival_moments import ArrivalMoments
 from gemini.propagation.tvtw_indexer import TVTWIndexer
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 
-from .flight_metadata_provider import FlightMetadataProvider
-from .fr_arrival_moments_builder import build_arrival_moments_from_fr
-from .fr_artifacts_loader import FRSegment, load_fr_segments
+from gemini.arr.flight_metadata_provider import FlightMetadataProvider
+from gemini.arr.fr_arrival_moments_builder import build_arrival_moments_from_fr
+from gemini.arr.fr_artifacts_loader import FRSegment, load_fr_segments
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +87,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     flights = FlightListGemini(args.flights_csv)
     jitter_config = GroundJitterConfig.from_json(args.ground_jitter_config)
     metadata_provider = FlightMetadataProvider(flights, jitter_config)
-    moments = build_arrival_moments_from_fr(
+    moments = _build_arrival_moments_with_progress(
         segments,
         metadata_provider,
         tvtw,
@@ -126,6 +134,43 @@ def _moment_rows(moments: ArrivalMoments) -> List[Dict[str, float | str | int]]:
             }
         )
     return rows
+
+
+def _build_arrival_moments_with_progress(
+    segments: List[FRSegment],
+    metadata_provider: FlightMetadataProvider,
+    tvtw: TVTWIndexer,
+    *,
+    volume_ids: Sequence[str] | None,
+    tail_tolerance: float,
+) -> ArrivalMoments:
+    """Build arrival moments while displaying a progress bar for the FR segments."""
+
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total}"),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        transient=True,
+    )
+
+    with progress:
+        task_id = progress.add_task("Processing FR segments", total=len(segments))
+
+        def iter_with_progress() -> Iterable[FRSegment]:
+            for segment in segments:
+                yield segment
+                progress.advance(task_id)
+
+        return build_arrival_moments_from_fr(
+            iter_with_progress(),
+            metadata_provider,
+            tvtw,
+            volume_ids=volume_ids,
+            tail_tolerance=tail_tolerance,
+        )
 
 
 if __name__ == "__main__":
