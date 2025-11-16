@@ -22,28 +22,38 @@ logger = logging.getLogger(__name__)
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--fr-demand", required=True, help="Path to gem_artifacts_demand_all CSV.")
+    parser.add_argument("--fr-demand",
+    required=False,
+    default="data/fr/gem_artifacts_demand_all",
+    help="Path to gem_artifacts_demand_all CSV.")
     parser.add_argument(
         "--fr-route-catalogue",
-        required=True,
+        required=False,
+        default="data/fr/gem_artifacts_route_catalogue_all",
         help="Path to gem_artifacts_route_catalogue_all CSV.",
     )
     parser.add_argument(
         "--flights-csv",
-        required=True,
+        required=False,
+        default="/mnt/d/project-tailwind/output/flights_20230717_0000-2359.csv",
         help="Flight metadata CSV consumed by FlightListGemini.",
     )
     parser.add_argument(
         "--ground-jitter-config",
-        required=True,
+        required=False,
+        default="data/fr/ground_jitter_default.json",
         help="Ground jitter configuration JSON.",
     )
     parser.add_argument(
         "--tvtw-indexer",
-        required=True,
+        required=False,
+        default="/mnt/d/project-tailwind/output/tvtw_indexer.json",
         help="TVTW indexer JSON describing the binning horizon.",
     )
-    parser.add_argument("--output-csv", required=True, help="Destination CSV for arrival moments.")
+    parser.add_argument("--output-csv",
+    required=False,
+    default="data/fr/arrival_moments.csv",
+    help="Destination CSV for arrival moments.")
     parser.add_argument(
         "--tail-tolerance",
         type=float,
@@ -52,7 +62,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--log-level",
-        default="INFO",
+        default="DEBUG",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
     return parser.parse_args(argv)
