@@ -14,4 +14,14 @@ __all__ = [
     "RegulationPlan",
     "VolumeRegulation",
     "VolumeTimeSeries",
+    "GemRunResult",
+    "GemService",
 ]
+
+
+def __getattr__(name):
+    if name in {"GemService", "GemRunResult"}:
+        from .gem_service import GemRunResult, GemService
+
+        return {"GemService": GemService, "GemRunResult": GemRunResult}[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
