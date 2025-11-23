@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Mapping, MutableMapping
 
@@ -11,33 +10,70 @@ import yaml
 logger = logging.getLogger(__name__)
 
 
-def _parse_iso_datetime(token: object) -> datetime:
+def _parse_hhmm(token: object, label: str) -> int:
+    """
+    Parse an HH:MM string into minutes since midnight.
+    
+    Args:
+        token: Raw value from the configuration.
+        label: Human-readable label for error messages.
+    Returns:
+        Minutes since midnight (0-1440). 24:00 is accepted as end-of-day.
+    """
     if not isinstance(token, str) or not token.strip():
-        raise ValueError("Ground-hold windows require non-empty ISO datetime strings")
-    try:
-        return datetime.fromisoformat(token.strip())
-    except ValueError as exc:
-        raise ValueError(f"Invalid ISO datetime: {token!r}") from exc
+        raise ValueError(f"Ground-hold windows require non-empty {label} strings")
+    text = token.strip()
+    parts = text.split(":")
+    if len(parts) != 2:
+        raise ValueError(f"Ground-hold window {label} must be in HH:MM format: {text!r}")
+    hour_str, minute_str = parts
+    if not hour_str.isdigit() or not minute_str.isdigit():
+        raise ValueError(f"Ground-hold window {label} must be numeric HH:MM: {text!r}")
+    hour = int(hour_str)
+    minute = int(minute_str)
+    if hour < 0 or hour > 24 or minute < 0 or minute > 59:
+        raise ValueError(f"Ground-hold window {label} out of range: {text!r}")
+    if hour == 24 and minute != 0:
+        raise ValueError(f"Ground-hold window {label} of 24 must use minutes 00: {text!r}")
+    minutes = hour * 60 + minute
+    if minutes > 1440:
+        raise ValueError(f"Ground-hold window {label} exceeds 24 hours: {text!r}")
+    return minutes
+
+
+def _format_hhmm(minutes: int) -> str:
+    hours, mins = divmod(int(minutes), 60)
+    return f"{hours:02d}:{mins:02d}"
 
 
 @dataclass(frozen=True)
 class GroundHoldWindow:
-    start: datetime
-    end: datetime
+    start_minutes: int
+    end_minutes: int
     rate_fph: float
     airport: str
     regulation_id: str | None = None
 
     def __post_init__(self) -> None:
-        if self.start >= self.end:
+        if self.start_minutes < 0 or self.end_minutes < 0:
+            raise ValueError("Ground-hold window bounds must be non-negative")
+        if self.start_minutes >= self.end_minutes:
             raise ValueError("Ground-hold window start must be earlier than end")
-        if (self.start.tzinfo is None) != (self.end.tzinfo is None):
-            raise ValueError("Ground-hold window start and end must share timezone awareness")
+        if self.end_minutes > 1440:
+            raise ValueError("Ground-hold window end cannot exceed 24:00")
         if self.rate_fph <= 0:
             raise ValueError("Ground-hold recovery rate must be positive")
         if not self.airport:
             raise ValueError("Ground-hold window must be associated with an airport")
         object.__setattr__(self, "airport", self.airport.upper())
+
+    @property
+    def start_str(self) -> str:
+        return _format_hhmm(self.start_minutes)
+
+    @property
+    def end_str(self) -> str:
+        return _format_hhmm(self.end_minutes)
 
 
 @dataclass
@@ -78,8 +114,8 @@ class GroundHoldConfig:
             airports[airport] = []
             for window in windows:
                 entry: Dict[str, object] = {
-                    "start": window.start.isoformat(),
-                    "end": window.end.isoformat(),
+                    "start": window.start_str,
+                    "end": window.end_str,
                     "rate_fph": float(window.rate_fph),
                 }
                 if window.regulation_id:
@@ -117,28 +153,28 @@ class GroundHoldConfig:
                         f"Ground-hold window for {airport} missing 'rate_fph' and no default specified"
                     )
                 rate_fph = float(rate_val)
-                start = _parse_iso_datetime(raw.get("start"))
-                end = _parse_iso_datetime(raw.get("end"))
+                start_minutes = _parse_hhmm(raw.get("start"), "start")
+                end_minutes = _parse_hhmm(raw.get("end"), "end")
                 regulation_id = raw.get("regulation_id")
                 parsed.append(
                     GroundHoldWindow(
-                        start=start,
-                        end=end,
+                        start_minutes=start_minutes,
+                        end_minutes=end_minutes,
                         rate_fph=rate_fph,
                         airport=airport,
                         regulation_id=str(regulation_id) if regulation_id is not None else None,
                     )
                 )
-            parsed.sort(key=lambda window: window.start)
+            parsed.sort(key=lambda window: window.start_minutes)
             for prev, curr in zip(parsed, parsed[1:]):
-                if curr.start < prev.end:
+                if curr.start_minutes < prev.end_minutes:
                     logger.warning(
                         "Ground-hold windows for %s overlap (%s-%s vs %s-%s)",
                         airport,
-                        prev.start,
-                        prev.end,
-                        curr.start,
-                        curr.end,
+                        prev.start_str,
+                        prev.end_str,
+                        curr.start_str,
+                        curr.end_str,
                     )
             windows[airport] = parsed
         return windows

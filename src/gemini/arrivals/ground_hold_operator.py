@@ -9,7 +9,7 @@ Algorithm Overview:
 -------------------
 The algorithm processes flights grouped by origin airport. For each airport, it applies
 ground hold windows that specify:
-- A time window (start, end)
+- A time window (start, end) in HH:MM (time-of-day only)
 - A maximum rate (flights per hour, fph)
 - An optional regulation identifier
 
@@ -30,8 +30,8 @@ Example:
 --------
 Consider a ground hold window:
 - Airport: KJFK
-- Start: 2023-07-17 10:00:00
-- End: 2023-07-17 12:00:00
+- Start: 10:00
+- End: 12:00
 - Rate: 30 flights/hour (tau = 2 minutes)
 
 Flights scheduled:
@@ -70,8 +70,8 @@ Input - GroundHoldConfig:
     # {
     #   "KJFK": [
     #     GroundHoldWindow(
-    #       start=datetime(2023, 7, 17, 10, 0, 0),
-    #       end=datetime(2023, 7, 17, 12, 0, 0),
+    #       start_minutes=600,  # 10:00
+    #       end_minutes=720,    # 12:00
     #       rate_fph=30.0,
     #       airport="KJFK",
     #       regulation_id="GH001"
@@ -95,14 +95,14 @@ Notes:
 - Flights scheduled at or after a window end are not included in that window
 - Multiple windows for the same airport are processed independently
 - Delays from multiple windows for the same flight are accumulated
-- Timezone awareness must be consistent between flight times and window times
+- Ground-hold windows are interpreted purely as time-of-day (HH:MM) without inferring dates
 """
 
 from __future__ import annotations
 
 import logging
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 from .delay_assignment_gemini import DelayAssignmentGemini
@@ -221,16 +221,17 @@ class GroundHoldOperator:
         # enumerate with start=1 gives 1-indexed position for delay calculation
         for index, (flight_id, scheduled_dt) in enumerate(flights, start=1):
             # Calculate when this flight could be released based on its position in queue
-            # First flight (index=1) releases at window.end, subsequent flights are spaced
+            # First flight (index=1) releases at window end, subsequent flights are spaced
             # by tau_minutes intervals
-            release_candidate = window.end + timedelta(minutes=(index - 1) * tau_minutes)
+            release_candidate_min = window.end_minutes + (index - 1) * tau_minutes
             
             # Flight cannot be released before its scheduled time
             # (ensures we don't "advance" flights, only delay them)
-            release_dt = max(scheduled_dt, release_candidate)
+            scheduled_min = _minutes_since_midnight(scheduled_dt)
+            release_min = max(scheduled_min, release_candidate_min)
             
             # Calculate delay in minutes (ensure non-negative)
-            delay_minutes = max((release_dt - scheduled_dt).total_seconds() / 60.0, 0.0)
+            delay_minutes = max(release_min - scheduled_min, 0.0)
             
             # Round up to nearest integer minute (conservative approach)
             delay_int = int(math.ceil(delay_minutes))
@@ -241,7 +242,7 @@ class GroundHoldOperator:
                 window.regulation_id or window.airport,
                 flight_id,
                 scheduled_dt,
-                release_dt,
+                _format_minutes(release_min),
                 delay_int,
             )
             yield flight_id, delay_int
@@ -252,41 +253,32 @@ class GroundHoldOperator:
         """
         Select flights that fall within a ground hold window's time range.
         
-        Flights are selected if their scheduled takeoff time is:
-        - >= window.start (inclusive)
-        - < window.end (exclusive)
+        Flights are selected if their scheduled takeoff time of day is:
+        - >= window.start_minutes (inclusive)
+        - < window.end_minutes (exclusive)
         
         Since flights are pre-sorted by takeoff time, we can break early
         when we encounter a flight scheduled at or after the window end.
         
         Args:
             flights: Sequence of (flight_id, takeoff_datetime) tuples, sorted by takeoff time
-            window: Ground hold window with start and end times
+            window: Ground hold window with time-of-day bounds
         
         Returns:
             List of flight entries within the window, sorted by takeoff time
-        
-        Note:
-            Validates timezone consistency between flight times and window times.
         """
         selected: List[FlightEntry] = []
         
         for flight_id, takeoff_dt in flights:
-            # Validate timezone consistency (raises ValueError if mismatched)
-            takeoff_dt = _ensure_comparable_datetimes(
-                takeoff_dt, window.start, window.airport, flight_id
-            )
-            takeoff_dt = _ensure_comparable_datetimes(
-                takeoff_dt, window.end, window.airport, flight_id
-            )
-            
+            takeoff_minutes = _minutes_since_midnight(takeoff_dt)
+
             # Skip flights scheduled before the window starts
-            if takeoff_dt < window.start:
+            if takeoff_minutes < window.start_minutes:
                 continue
             
             # Since flights are sorted, once we hit a flight at/after window end,
             # all subsequent flights are also outside the window
-            if takeoff_dt >= window.end:
+            if takeoff_minutes >= window.end_minutes:
                 break
             
             # Flight is within window: [start, end)
@@ -340,40 +332,21 @@ class GroundHoldOperator:
         return grouped
 
 
-def _ensure_comparable_datetimes(
-    flight_dt: datetime, reference: datetime, airport: str, flight_id: str
-) -> datetime:
+def _minutes_since_midnight(dt: datetime) -> float:
     """
-    Validate that two datetime objects have compatible timezone awareness.
-    
-    Both datetimes must either both be timezone-aware or both be timezone-naive.
-    Mixing timezone-aware and timezone-naive datetimes can lead to incorrect
-    comparisons and calculations.
-    
-    Args:
-        flight_dt: Flight's scheduled datetime
-        reference: Window's reference datetime (start or end)
-        airport: Airport code for error message
-        flight_id: Flight identifier for error message
-    Returns:
-        Possibly adjusted flight datetime that is comparable to ``reference``.
+    Convert a datetime to minutes since midnight of the same day.
     """
-    flight_tz = flight_dt.tzinfo
-    reference_tz = reference.tzinfo
-    
-    # Check if timezone awareness is mismatched (one is None, other is not)
-    if (flight_tz is None) != (reference_tz is None):
-        if flight_tz is None and reference_tz is not None:
-            logger.debug(
-                "Flight %s has no timezone; assuming UTC to compare with %s window bounds",
-                flight_id,
-                airport,
-            )
-            return flight_dt.replace(tzinfo=timezone.utc)
-        raise ValueError(
-            f"Timezone mismatch between flight {flight_id} ({flight_dt}) and ground-hold window for {airport}"
-        )
-    return flight_dt
+    midnight = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    return (dt - midnight).total_seconds() / 60.0
+
+
+def _format_minutes(total_minutes: float) -> str:
+    """
+    Format a minute count as HH:MM, allowing values beyond 24:00 for logging.
+    """
+    minutes_int = int(round(total_minutes))
+    hours, mins = divmod(minutes_int, 60)
+    return f"{hours:02d}:{mins:02d}"
 
 
 __all__ = ["GroundHoldOperator"]

@@ -41,13 +41,13 @@ def test_ground_hold_config_roundtrip(tmp_path):
         default_rate_fph: 12
         airports:
           lfpg:
-            - start: '2023-07-01T09:00:00'
-              end: '2023-07-01T10:00:00'
+            - start: '09:00'
+              end: '10:00'
               rate_fph: 6
               regulation_id: REG-1
           eham:
-            - start: '2023-07-01T08:00:00'
-              end: '2023-07-01T09:00:00'
+            - start: '08:00'
+              end: '09:00'
               regulation_id: REG-2
         """
     ).strip()
@@ -73,8 +73,8 @@ def test_ground_hold_config_rejects_missing_rate(tmp_path):
         """
         airports:
           lfpg:
-            - start: '2023-07-01T09:00:00'
-              end: '2023-07-01T09:30:00'
+            - start: '09:00'
+              end: '09:30'
         """
     ).strip()
     config_path = tmp_path / "invalid.yaml"
@@ -92,8 +92,8 @@ def test_ground_hold_operator_computes_fcfs_delays():
         "IGNORED": {"takeoff_time": base + timedelta(minutes=70), "origin": "LFPG"},
     }
     window = GroundHoldWindow(
-        start=base,
-        end=base + timedelta(minutes=30),
+        start_minutes=9 * 60,
+        end_minutes=9 * 60 + 30,
         rate_fph=2.0,
         airport="LFPG",
         regulation_id="REG-A",
@@ -157,8 +157,8 @@ def test_fr_arrivals_cli_shifts_bins_when_ground_hold_applied(tmp_path):
         encoding="utf-8",
     )
     hold_yaml.write_text(
-        "airports:\n  LFPG:\n    - start: '2023-07-01T09:00:00'\n"
-        "      end: '2023-07-01T11:00:00'\n"
+        "airports:\n  LFPG:\n    - start: '09:00'\n"
+        "      end: '11:00'\n"
         "      rate_fph: 2.0\n",
         encoding="utf-8",
     )
