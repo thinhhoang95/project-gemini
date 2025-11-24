@@ -52,11 +52,11 @@ except ModuleNotFoundError:  # Allows running the CLI as a standalone script.
     from gemini.propagation.hourly_kernel import HourlyKernelEstimator
     from gemini.propagation.tvtw_indexer import TVTWIndexer
 
-DEFAULT_MASTER = "D:/project-tailwind/output/flights_20230717_0000-2359.csv"
+DEFAULT_MASTER = "/Volumes/CrucialX/project-tailwind/output/flights_20230717_0000-2359.csv"
 DEFAULT_FR_DEMAND = "data/fr/gem_artifacts_demand_all"
 DEFAULT_FR_ROUTE_CATALOGUE = "data/fr/gem_artifacts_route_catalogue_all"
-DEFAULT_TVTW = "D:/project-tailwind/output/tvtw_indexer.json"
-DEFAULT_OUTPUT = "D:/project-gemini/data/hourly_kernels.csv"
+DEFAULT_TVTW = "/Volumes/CrucialX/project-tailwind/output/tvtw_indexer.json"
+DEFAULT_OUTPUT = "/Volumes/CrucialX/project-gemini/data/hourly_kernels.csv"
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:

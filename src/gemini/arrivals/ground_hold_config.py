@@ -46,7 +46,7 @@ def _format_hhmm(minutes: int) -> str:
     return f"{hours:02d}:{mins:02d}"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class GroundHoldWindow:
     start_minutes: int
     end_minutes: int
@@ -54,7 +54,59 @@ class GroundHoldWindow:
     airport: str
     regulation_id: str | None = None
 
-    def __post_init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        start_minutes: int | float | None = None,
+        end_minutes: int | float | None = None,
+        start: str | int | float | None = None,
+        end: str | int | float | None = None,
+        rate_fph: float | int,
+        airport: str,
+        regulation_id: str | None = None,
+    ) -> None:
+        start_val = self._coerce_minutes(start_minutes, start, "start")
+        end_val = self._coerce_minutes(end_minutes, end, "end")
+        rate_val = float(rate_fph)
+        airport_code = str(airport or "").strip().upper()
+        regulation = str(regulation_id) if regulation_id is not None else None
+
+        object.__setattr__(self, "start_minutes", start_val)
+        object.__setattr__(self, "end_minutes", end_val)
+        object.__setattr__(self, "rate_fph", rate_val)
+        object.__setattr__(self, "airport", airport_code)
+        object.__setattr__(self, "regulation_id", regulation)
+        self._validate()
+
+    @staticmethod
+    def _coerce_minutes(
+        minutes_value: int | float | None, raw_value: str | int | float | None, label: str
+    ) -> int:
+        """Normalize provided minute values, allowing either *_minutes or HH:MM strings."""
+        normalized: int | None = None
+        if minutes_value is not None:
+            if isinstance(minutes_value, (int, float)):
+                normalized = int(minutes_value)
+            else:
+                raise TypeError(f"Ground-hold window {label}_minutes must be numeric")
+
+        if raw_value is not None:
+            parsed = (
+                _parse_hhmm(raw_value, label)
+                if isinstance(raw_value, str)
+                else int(raw_value)
+            )
+            if normalized is not None and parsed != normalized:
+                raise ValueError(f"Conflicting ground-hold window {label} values provided")
+            normalized = parsed
+
+        if normalized is None:
+            raise TypeError(
+                f"GroundHoldWindow requires either {label}_minutes or {label} (HH:MM)"
+            )
+        return normalized
+
+    def _validate(self) -> None:
         if self.start_minutes < 0 or self.end_minutes < 0:
             raise ValueError("Ground-hold window bounds must be non-negative")
         if self.start_minutes >= self.end_minutes:
@@ -65,7 +117,6 @@ class GroundHoldWindow:
             raise ValueError("Ground-hold recovery rate must be positive")
         if not self.airport:
             raise ValueError("Ground-hold window must be associated with an airport")
-        object.__setattr__(self, "airport", self.airport.upper())
 
     @property
     def start_str(self) -> str:
