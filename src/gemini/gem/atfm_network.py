@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import heapq
 import math
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -24,8 +25,11 @@ class VolumeTimeSeries:
     lambda_var: List[float]
     queue_mean: List[float]
     queue_var: List[float]
+    queue_cov_lag1: List[float]
     departure_mean: List[float]
     departure_var: List[float]
+    departure_cov_lag1: List[float]
+    queue_reflection_slope: List[float]
 
 
 @dataclass
@@ -57,7 +61,8 @@ class ATFMNetworkModel:
         self.num_bins = tvtw.num_bins
         self.delta_minutes = tvtw.time_bin_minutes
         self.bins_per_hour = tvtw.bins_per_hour
-        self.volume_ids: List[str] = list(volume_graph.volumes.keys())
+        base_order: List[str] = list(volume_graph.volumes.keys())
+        self.volume_ids: List[str] = self._build_volume_order(base_order)
 
     # ---------------------------------------------------------------------- API --
     def run(self, plan: Optional[RegulationPlan] = None) -> ATFMRunResult:
@@ -76,12 +81,41 @@ class ATFMNetworkModel:
             volume_id: [None] * self.num_bins for volume_id in self.volume_ids
         }
 
+    def _build_volume_order(self, base_order: List[str]) -> List[str]:
+        """Return a propagation order ensuring upstream queues precede downstream."""
+        in_degree: Dict[str, int] = {volume_id: 0 for volume_id in base_order}
+        adjacency: Dict[str, List[str]] = {volume_id: [] for volume_id in base_order}
+        for edge in self.kernels.edges.keys():
+            upstream = edge.upstream
+            downstream = edge.downstream
+            if upstream not in adjacency or downstream not in adjacency:
+                continue
+            adjacency[upstream].append(downstream)
+            in_degree[downstream] += 1
+        rank = {volume_id: idx for idx, volume_id in enumerate(base_order)}
+        ready = [(rank[vid], vid) for vid, deg in in_degree.items() if deg == 0]
+        heapq.heapify(ready)
+        order: List[str] = []
+        while ready:
+            _, volume_id = heapq.heappop(ready)
+            order.append(volume_id)
+            for downstream in adjacency.get(volume_id, []):
+                in_degree[downstream] -= 1
+                if in_degree[downstream] == 0:
+                    heapq.heappush(ready, (rank[downstream], downstream))
+        if len(order) != len(base_order):
+            placed = set(order)
+            remaining = [vid for vid in base_order if vid not in placed]
+            order.extend(remaining)
+        return order
+
     def _run_with_capacities(
         self, capacities: Dict[str, List[Optional[float]]]
     ) -> ATFMRunResult:
         series = self._init_series()
         prev_pair_weight: Dict[str, Optional[float]] = {v: None for v in self.volume_ids}
         w_bin: Dict[Tuple[str, int], float] = {}
+        arrival_cov_bin: Dict[Tuple[str, int], float] = {}
 
         for t in range(self.num_bins):
             # Step 1: assemble arrival moments
@@ -90,15 +124,21 @@ class ATFMNetworkModel:
                 series[volume_id].lambda_mean[t] = lam
                 series[volume_id].lambda_var[t] = nu
 
-            # Step 1b: compute F1 pair/per-bin weights
+            # Step 1b: build F1 deflation weights using a provisional arrival
+            # lag-1 covariance γ_{v,t,t+1} based on information up to this point.
+            # We intentionally do *not* store this provisional γ into arrival_cov_bin
+            # yet, because departure_cov_lag1[t-1] will be refined by the queue
+            # step below. A second pass after the queue update will write the
+            # final γ_{v,t,t+1} consistent with Cov(D_{u,t-1}, D_{u,t}) for all
+            # upstream nodes u, regardless of volume ordering.
             for volume_id in self.volume_ids:
                 nu_t = series[volume_id].lambda_var[t]
                 w_val: float
                 if t < self.num_bins - 1:
-                    gamma = self._compute_arrival_cov_lag1(volume_id, t, series)
+                    gamma_prov = self._compute_arrival_cov_lag1(volume_id, t, series)
                     nu_next = self._predict_next_variance(volume_id, t, series)
                     denom = max(nu_t + nu_next, 1e-6)
-                    pair = 1.0 + 2.0 * gamma / denom
+                    pair = 1.0 + 2.0 * gamma_prov / denom
                     pair = _clip_weight(pair)
                     prev_pair = prev_pair_weight.get(volume_id)
                     if prev_pair is None:
@@ -111,9 +151,33 @@ class ATFMNetworkModel:
                     w_val = prev_pair if prev_pair is not None else 1.0
                 w_bin[(volume_id, t)] = _clip_weight(w_val)
 
-            # Step 2: queue update per volume using deflated variance
+            # Step 2: queue update using the F1 weights. This step updates
+            # departure_cov_lag1[t-1] for each volume (when t > 0), which is
+            # required to form the fully corrected arrival lag-1 covariance
+            # γ_{v,t,t+1} in equation (10) of the master guide.
             for volume_id in self.volume_ids:
-                self._queue_step(volume_id, t, capacities, w_bin, series)
+                self._queue_step(
+                    volume_id,
+                    t,
+                    capacities,
+                    w_bin,
+                    arrival_cov_bin,
+                    series,
+                )
+
+            # Step 1b (final): now that all upstream departure covariances
+            # Cov(D_{u,t-1}, D_{u,t}) are available from the queue step, build
+            # the *final* arrival lag-1 covariance for this bin and store it in
+            # arrival_cov_bin. This makes γ_{v,t,t+1} consistent with the
+            # reflected-queue dynamics for use in subsequent bins (queue
+            # covariance propagation and future F1 weights).
+            if t < self.num_bins - 1:
+                for volume_id in self.volume_ids:
+                    gamma = self._compute_arrival_cov_lag1(volume_id, t, series)
+                    arrival_cov_bin[(volume_id, t)] = gamma
+            else:
+                for volume_id in self.volume_ids:
+                    arrival_cov_bin[(volume_id, t)] = 0.0
 
         total_mean, total_var = self._aggregate_delay(series)
         return ATFMRunResult(
@@ -130,8 +194,11 @@ class ATFMNetworkModel:
                 lambda_var=[0.0] * T,
                 queue_mean=[0.0] * (T + 1),
                 queue_var=[0.0] * (T + 1),
+                queue_cov_lag1=[0.0] * T,
                 departure_mean=[0.0] * T,
                 departure_var=[0.0] * T,
+                departure_cov_lag1=[0.0] * T,
+                queue_reflection_slope=[0.0] * T,
             )
             for v in self.volume_ids
         }
@@ -142,7 +209,6 @@ class ATFMNetworkModel:
     ) -> Tuple[float, float]:
         lam = self.arrivals.mean(volume_id, t)
         nu = self.arrivals.variance(volume_id, t)
-
         incoming_edges = self.kernels.get_incoming(volume_id)
         if not incoming_edges:
             return lam, nu
@@ -156,13 +222,24 @@ class ATFMNetworkModel:
             for lag in range(1, max_lag + 1):
                 departure_bin = t - lag
                 hour_index = departure_bin // self.bins_per_hour
-                kernel_val = edge_kernel.get(hour_index, lag)
-                if kernel_val == 0.0:
+                k_val = edge_kernel.get(hour_index, lag)
+                if k_val == 0.0:
                     continue
                 dep_mean = upstream_series.departure_mean[departure_bin]
                 dep_var = upstream_series.departure_var[departure_bin]
-                lam += kernel_val * dep_mean
-                nu += kernel_val * (1.0 - kernel_val) * dep_mean + (kernel_val**2) * dep_var
+                lam += k_val * dep_mean
+                nu += k_val * (1.0 - k_val) * dep_mean + (k_val * k_val) * dep_var
+
+                # Cross-bin variance term from Cov(D_{t-k-1}, D_{t-k}) as in eq. (8)
+                # of the master guide. Use the hour of the departure bin for both
+                # lags so that K_{e,h}(k) and K_{e,h}(k+1) are evaluated at the same
+                # hourly kernel, consistent with the generative definition.
+                if departure_bin > 0 and lag < edge_kernel.max_lag_bins:
+                    k_next = edge_kernel.get(hour_index, lag + 1)
+                    if k_next != 0.0:
+                        dep_cov = upstream_series.departure_cov_lag1[departure_bin - 1]
+                        if dep_cov != 0.0:
+                            nu += 2.0 * k_val * k_next * dep_cov
         return lam, nu
 
     def _compute_arrival_cov_lag1(
@@ -170,6 +247,8 @@ class ATFMNetworkModel:
     ) -> float:
         if t >= self.num_bins - 1:
             return 0.0
+
+        # Start from exogenous lag-1 covariance γ^{ext}_{v,t,t+1}.
         gamma = self.arrivals.covariance_lag1(volume_id, t)
         incoming_edges = self.kernels.get_incoming(volume_id)
         if not incoming_edges:
@@ -177,6 +256,7 @@ class ATFMNetworkModel:
 
         for edge in incoming_edges:
             edge_kernel = self.kernels.edges[edge]
+            # We need k+1 to be valid, so restrict to at most (max_lag_bins - 1).
             max_lag = min(edge_kernel.max_lag_bins - 1, t)
             if max_lag <= 0:
                 continue
@@ -184,27 +264,42 @@ class ATFMNetworkModel:
             for lag in range(1, max_lag + 1):
                 departure_bin = t - lag
                 hour_index = departure_bin // self.bins_per_hour
-                k_val = edge_kernel.get(hour_index, lag)
-                k_next = edge_kernel.get(hour_index, lag + 1)
-                if k_val == 0.0 or k_next == 0.0:
+                k = edge_kernel.get(hour_index, lag)
+                k_plus = edge_kernel.get(hour_index, lag + 1)
+                if k == 0.0 and k_plus == 0.0:
                     continue
+
                 dep_mean = upstream_series.departure_mean[departure_bin]
                 dep_var = upstream_series.departure_var[departure_bin]
-                gamma += (-dep_mean + dep_var) * k_val * k_next
+
+                # First two terms in eq. (10): (-E[D] + Var(D)) * K(k) * K(k+1).
+                if k != 0.0 and k_plus != 0.0:
+                    gamma += (-dep_mean + dep_var) * k * k_plus
+
+                # Cov(D_{t-k}, D_{t-k+1}) terms.
+                dep_cov_forward = upstream_series.departure_cov_lag1[departure_bin]
+                if dep_cov_forward != 0.0:
+                    # K(k)^2 * Cov(D_{t-k}, D_{t-k+1})
+                    if k != 0.0:
+                        gamma += (k * k) * dep_cov_forward
+
+                    # K(k-1) * K(k+1) * Cov(D_{t-k}, D_{t-k+1})
+                    if lag > 1 and k_plus != 0.0:
+                        k_minus = edge_kernel.get(hour_index, lag - 1)
+                        if k_minus != 0.0:
+                            gamma += k_minus * k_plus * dep_cov_forward
         return gamma
 
     def _predict_next_variance(
         self, volume_id: str, t: int, series: Dict[str, VolumeTimeSeries]
     ) -> float:
-        """Online proxy for ν_{t+1} used in the F1 weight."""
-        next_bin = t + 1
-        if next_bin >= self.num_bins:
-            return series[volume_id].lambda_var[t]
-        # Default to exogenous variance if provided, otherwise reuse current.
-        nu_next = self.arrivals.variance(volume_id, next_bin)
-        if nu_next == 0.0:
-            nu_next = series[volume_id].lambda_var[t]
-        return nu_next
+        """Online proxy for ν_{t+1} used in the F1 weight.
+
+        We use the fully propagated arrival variance at t as a local-stationarity
+        proxy for the next bin so that F1 reflects network-induced variability,
+        not just exogenous structure.
+        """
+        return series[volume_id].lambda_var[t]
 
     # ------------------------------------------------------------- queue update --
     def _queue_step(
@@ -213,6 +308,7 @@ class ATFMNetworkModel:
         t: int,
         capacities: Dict[str, List[Optional[float]]],
         w_bin: Dict[Tuple[str, int], float],
+        arrival_cov_bin: Dict[Tuple[str, int], float],
         series: Dict[str, VolumeTimeSeries],
     ) -> None:
         vol_series = series[volume_id]
@@ -229,31 +325,56 @@ class ATFMNetworkModel:
             cap = capacity_list[t]
 
         if cap is None:
+            # Entire backlog is released immediately when there is no cap.
             vol_series.queue_mean[t + 1] = 0.0
             vol_series.queue_var[t + 1] = 0.0
-            vol_series.departure_mean[t] = lam
-            vol_series.departure_var[t] = max(nu_deflated, 0.0)
-            return
+            vol_series.departure_mean[t] = lam + q_mean
+            vol_series.departure_var[t] = max(nu_deflated + q_var, 0.0)
+            Phi = 0.0  # Reflection slope when no regulation binds.
+        else:
+            delta = lam - cap
+            mu = q_mean + delta
+            sigma2 = max(q_var + nu_deflated, 0.0)
+            sigma = math.sqrt(max(sigma2, 1e-12))
+            a = mu / sigma if sigma > 0 else 0.0
+            phi = _std_normal_pdf(a)
+            Phi = _std_normal_cdf(a)
 
-        delta = lam - cap
-        mu = q_mean + delta
-        sigma2 = max(q_var + nu_deflated, 0.0)
-        sigma = math.sqrt(max(sigma2, 1e-12))
-        a = mu / sigma if sigma > 0 else 0.0
-        phi = _std_normal_pdf(a)
-        Phi = _std_normal_cdf(a)
+            E_Q = sigma * phi + mu * Phi
+            EQ2 = (mu * mu + sigma2) * Phi + mu * sigma * phi
+            Var_Q = max(EQ2 - E_Q * E_Q, 0.0)
 
-        E_Q = sigma * phi + mu * Phi
-        EQ2 = (mu * mu + sigma2) * Phi + mu * sigma * phi
-        Var_Q = max(EQ2 - E_Q * E_Q, 0.0)
+            vol_series.queue_mean[t + 1] = E_Q
+            vol_series.queue_var[t + 1] = Var_Q
+            D_mean = lam + q_mean - E_Q
+            vol_series.departure_mean[t] = D_mean
+            cov_x_y = EQ2 - mu * E_Q  # Covariance of unconstrained queue and its positive part
+            D_var = sigma2 + Var_Q - 2.0 * cov_x_y
+            vol_series.departure_var[t] = max(D_var, 0.0)
 
-        vol_series.queue_mean[t + 1] = E_Q
-        vol_series.queue_var[t + 1] = Var_Q
-        D_mean = lam + q_mean - E_Q
-        vol_series.departure_mean[t] = D_mean
-        p_cong = Phi
-        D_var = max((1.0 - p_cong) * nu_deflated, 0.0)
-        vol_series.departure_var[t] = D_var
+        # Lag-1 covariance propagation via reflection linearisation.
+        # Phi is the reflection slope mapping the unconstrained queue U_t to Q_{t+1}.
+        vol_series.queue_reflection_slope[t] = Phi
+        u_var_t = max(q_var + nu_deflated, 0.0)  # Var(U_t) if needed elsewhere
+
+        if t == 0:
+            # Start-of-day queue is deterministic (Q_0 = 0), so Cov(Q_0, Q_1) ≈ 0.
+            vol_series.queue_cov_lag1[t] = 0.0
+        else:
+            prev_slope = vol_series.queue_reflection_slope[t - 1]
+            # Approximate Cov(U_{t-1}, U_t) as Cov(Q_{t-1}, Q_t) + Cov(Λ_{t-1}, Λ_t),
+            # ignoring cross terms such as Cov(Q_{t-1}, Λ_t).
+            base_cov = vol_series.queue_cov_lag1[t - 1] + arrival_cov_bin.get(
+                (volume_id, t - 1), 0.0
+            )
+
+            # Queue lag-1 covariance: Cov(Q_t, Q_{t+1}) ≈ Φ_{t-1} Φ_t Cov(U_{t-1}, U_t).
+            queue_cov = prev_slope * Phi * base_cov
+            vol_series.queue_cov_lag1[t] = queue_cov
+
+            # Departure lag-1 covariance: Cov(D_{t-1}, D_t) ≈ (1-Φ_{t-1})(1-Φ_t) Cov(U_{t-1}, U_t).
+            dep_cov = (1.0 - prev_slope) * (1.0 - Phi) * base_cov
+            vol_series.departure_cov_lag1[t - 1] = dep_cov
 
     # ---------------------------------------------------------- aggregation -----
     def _aggregate_delay(self, series: Dict[str, VolumeTimeSeries]) -> Tuple[float, float]:
@@ -262,7 +383,17 @@ class ATFMNetworkModel:
         dt = self.delta_minutes
         for volume_series in series.values():
             total_mean += dt * sum(volume_series.queue_mean[:-1])
-            total_var += (dt * dt) * sum(volume_series.queue_var[:-1])
+            var_sum = 0.0
+            num_queue_bins = max(0, len(volume_series.queue_var) - 1)
+            cov_limit = min(
+                len(volume_series.queue_cov_lag1),
+                max(0, len(volume_series.queue_mean) - 2),
+            )
+            for idx in range(num_queue_bins):
+                var_sum += volume_series.queue_var[idx]
+                if idx < cov_limit:
+                    var_sum += 2.0 * volume_series.queue_cov_lag1[idx]
+            total_var += (dt * dt) * var_sum
         return total_mean, total_var
 
 
@@ -386,8 +517,11 @@ def _write_volume_series_csv(
                     "lambda_var": series.lambda_var[t],
                     "queue_mean": series.queue_mean[t],
                     "queue_var": series.queue_var[t],
+                    "queue_cov_lag1": series.queue_cov_lag1[t] if t < len(series.queue_cov_lag1) else 0.0,
                     "departure_mean": series.departure_mean[t],
                     "departure_var": series.departure_var[t],
+                    "departure_cov_lag1": series.departure_cov_lag1[t],
+                    "queue_reflection_slope": series.queue_reflection_slope[t],
                     "delay_minutes_bin": delta_minutes * series.queue_mean[t],
                 }
             )

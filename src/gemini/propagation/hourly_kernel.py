@@ -92,11 +92,31 @@ class HourlyKernelEstimator:
         if not self.edge_totals:
             return rows
 
-        for edge, total_traversals in self.edge_totals.items():
-            if total_traversals < self.min_traversals_per_edge:
-                continue
+        # 1. Identify retained edges first to ensure we only normalize over valid routes
+        retained_edges = {
+            edge
+            for edge, total in self.edge_totals.items()
+            if total >= self.min_traversals_per_edge
+        }
+
+        # 2. Pre-compute upstream totals for routing probability normalization
+        # We calculate totals only over retained edges so that probability mass
+        # isn't lost to dropped "noise" edges.
+        upstream_totals: Dict[str, float] = defaultdict(float)
+        upstream_hour_totals: Dict[Tuple[str, int], float] = defaultdict(float)
+
+        for edge in retained_edges:
+            upstream_totals[edge.upstream] += self.edge_totals[edge]
+
+        for (edge, hour), count in self.edge_hour_counts.items():
+            if edge in retained_edges:
+                upstream_hour_totals[(edge.upstream, hour)] += count
+
+        for edge in retained_edges:
+            total_traversals = self.edge_totals[edge]
             global_lag_counts = self.edge_lag_totals[edge]
             lost_count_edge = self.edge_lost_totals.get(edge, 0.0)
+            
             hours: Iterable[int]
             if self.emit_empty_hours:
                 hours = range(self.hours_per_day)
@@ -105,13 +125,32 @@ class HourlyKernelEstimator:
                     hour for (edge_key, hour) in self.edge_hour_counts.keys() if edge_key == edge
                 )
 
+            # Global routing probability P(v | u)
+            total_u = upstream_totals.get(edge.upstream, 0.0)
+            global_routing_prob = (total_traversals / total_u) if total_u > 0 else 0.0
+
             for hour in hours:
                 N_eh = self.edge_hour_counts.get((edge, hour), 0.0)
                 if not self.emit_empty_hours and N_eh == 0:
                     continue
+
+                # --- Routing Probability P(v | u, h) ---
+                # Shrink hourly routing choice towards global routing choice.
+                N_uh = upstream_hour_totals.get((edge.upstream, hour), 0.0)
+                
+                alpha_route = 0.0
+                if N_uh > 0:
+                    alpha_route = N_uh / (N_uh + self.shrinkage_M)
+                
+                local_routing_prob = (N_eh / N_uh) if N_uh > 0 else 0.0
+                routing_prob = alpha_route * local_routing_prob + (1.0 - alpha_route) * global_routing_prob
+
+                # --- Lag Probability P(lag | u->v, h) ---
+                # Shrink hourly lag distribution towards global lag distribution.
                 alpha = 0.0
                 if N_eh > 0:
                     alpha = N_eh / (N_eh + self.shrinkage_M)
+                
                 lag_counts = self.edge_hour_lag_counts.get((edge, hour), {})
                 lost_count_hour = self.edge_hour_lost_counts.get((edge, hour), 0.0)
                 lost_fraction_hour = (lost_count_hour / N_eh) if N_eh > 0 else 0.0
@@ -123,9 +162,16 @@ class HourlyKernelEstimator:
                         if total_traversals > 0
                         else 0.0
                     )
-                    kernel_value = alpha * local_prob + (1.0 - alpha) * global_prob
+                    
+                    # Conditional kernel: P(lag | u->v, h)
+                    kernel_cond = alpha * local_prob + (1.0 - alpha) * global_prob
+
+                    # Joint kernel: P(v, lag | u, h) = P(lag | u->v, h) * P(v | u, h)
+                    kernel_value = kernel_cond * routing_prob
+
                     if not self.emit_empty_hours and N_eh == 0 and kernel_value == 0.0:
                         continue
+
                     rows.append(
                         {
                             "edge_u": edge.upstream,

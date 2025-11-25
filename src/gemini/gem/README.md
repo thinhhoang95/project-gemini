@@ -68,10 +68,13 @@ Conceptually:
   - `VolumeTimeSeries`: for each volume, holds per-bin time series:
     - `lambda_mean`, `lambda_var`: arrival stats.
     - `queue_mean`, `queue_var`: queue length stats (one extra element for state at `T`).
+    - `queue_cov_lag1`: lag-1 queue covariance $\operatorname{Cov}(Q_t,Q_{t+1})$ for delay aggregation.
     - `departure_mean`, `departure_var`: departure stats.
+    - `departure_cov_lag1`: lag-1 departure covariance $\operatorname{Cov}(D_t,D_{t+1})$ used when forming downstream arrival statistics.
+    - `queue_reflection_slope`: helper slope $\Phi(a_t)$ from the reflected-Gaussian update (primarily for diagnostics).
   - `ATFMRunResult`:
     - `by_volume`: mapping `volume_id → VolumeTimeSeries`.
-    - `total_delay_mean`, `total_delay_var`: integrated network delay over all volumes and time.
+    - `total_delay_mean`, `total_delay_var`: integrated network delay over all volumes and time (variance uses the lag-1 queue covariance correction).
 
 - **`ATFMNetworkModel`** (`atfm_network.py`)
   - The **core propagation engine** that:
@@ -232,7 +235,7 @@ For each `volume_id`:
 Key steps:
 
 1. **Base quantities**:
-   - `nu_t = series[volume_id].lambda_var[t]` (current variance).
+   - `nu_t = series[volume_id].lambda_var[t]` (current, fully propagated variance).
    - If `t < num_bins - 1`, we attempt to estimate correlation with bin `t+1`.
 
 2. **Arrival covariance at lag 1 (`gamma`)**:
@@ -245,8 +248,9 @@ Key steps:
 
 3. **Proxy for next-bin variance `nu_next`**:
    - `_predict_next_variance(...)`:
-     - Use `arrivals.variance(volume_id, t+1)` if available.
-     - If zero, fallback to current bin variance.
+     - Uses the **fully propagated** arrival variance at `t` as a local-stationarity
+       proxy for `ν_{t+1}`, so that F1 reflects both exogenous and network-induced
+       variability.
 
 4. **Compute pair weight**:
    - Denominator: `denom = max(nu_t + nu_next, 1e-6)`.
@@ -265,7 +269,7 @@ The F1 weight partially reduces variance to keep the queue approximation stable 
 
 For each `volume_id`:
 
-- `_queue_step(volume_id, t, capacities, w_bin, series)`:
+- `_queue_step(volume_id, t, capacities, w_bin, arrival_cov_bin, series)`:
 
   1. **Fetch current state**:
      - From `series[volume_id]`:
@@ -282,12 +286,12 @@ For each `volume_id`:
      - `cap = capacity_list[t]` if defined, else `None`.
 
   3. **Unregulated case (`cap is None`)**:
-     - Intuition: no capacity constraint → no queue can build up.
+     - Intuition: any existing backlog instantly departs once the queue is unregulated.
      - Actions:
        - `queue_mean[t+1] = 0.0`
        - `queue_var[t+1] = 0.0`
-       - `departure_mean[t] = lam` (all arrivals depart)
-       - `departure_var[t] = max(nu_deflated, 0.0)` (same variance as arrivals)
+       - `departure_mean[t] = lam + q_mean` (arrivals plus backlog depart)
+       - `departure_var[t] = max(nu_deflated + q_var, 0.0)` (preserve queue variance)
        - Return.
 
   4. **Regulated case (`cap` is a float)**:
@@ -318,11 +322,9 @@ For each `volume_id`:
        - Flow conservation: departures = arrivals + current queue - next queue
        - `D_mean = lam + q_mean - E_Q`
        - `departure_mean[t] = D_mean`
-
-       - Congestion probability:
-         - `p_cong = Phi` (approx probability queue is positive).
-       - Departure variance:
-         - `D_var = max((1.0 - p_cong) * nu_deflated, 0.0)`
+       - Departure variance uses \( D_t = \Lambda_t + Q_t - Q_{t+1} \):
+         - Let `cov_x_y = EQ2 - mu * E_Q` (covariance of \(Q_t+\Lambda_t-cap\) with the truncated queue).
+         - `D_var = max(sigma2 + Var_Q - 2 * cov_x_y, 0.0)`
        - `departure_var[t] = D_var`
 
 **Idea**: Each bin is treated as a single-step queue update where arrivals plus previous queue either exceed capacity (queue persists) or not (queue drains). The algorithm uses a normal approximation to compute expectations and variances.
@@ -335,14 +337,22 @@ After all time bins are processed:
 
   - For each volume’s `volume_series`:
     - `total_mean += delta_minutes * sum(volume_series.queue_mean[:-1])`
-    - `total_var += (delta_minutes**2) * sum(volume_series.queue_var[:-1])`
+    - For the variance, approximate the variance of the time-integrated queue as:
+      - \[
+          \operatorname{Var}\Bigl(\sum_t Q_t\Bigr)
+          \approx \sum_t \operatorname{Var}(Q_t)
+                  + 2 \sum_t \operatorname{Cov}(Q_t, Q_{t+1}),
+        \]
+        implemented as:
+        - `var_sum = sum(queue_var[t] + 2 * queue_cov_lag1[t] for t in valid_bins)`
+        - `total_var += (delta_minutes**2) * var_sum`
 
   - `delta_minutes = self.delta_minutes = tvtw.time_bin_minutes`.
 
 - Interpreted as:
   - **Total delay mean** = integral (sum over time bins) of queue length (flights) × bin duration (minutes)  
     ⇒ units: flight-minutes.
-  - **Total delay variance** similarly scaled.
+  - **Total delay variance** = same integral but with a **lag‑1 covariance correction** via `queue_cov_lag1` to account for temporal correlation in queue length.
 
 Result is packaged into `ATFMRunResult`.
 
@@ -506,4 +516,3 @@ print(series_A.queue_mean[:10])  # first 10 bins of queue for VOL_A
 ```
 
 This programmatic view mirrors what the CLI does, but gives you direct access to `VolumeTimeSeries` and lets you integrate ATFM propagation into other pipelines.
-
